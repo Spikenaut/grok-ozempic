@@ -13,6 +13,8 @@ readme = "README.md"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 safetensors = "0.4"          # for direct safetensors support (Grok raw weights)
+memmap2 = "0.9"              # zero-copy memory-mapped file I/O for out-of-core streaming
+half = "2.4"                 # FP16 (f16) type for mixed-precision router weights
 tokio = { version = "1.0", features = ["full"], optional = true }  # future async loading
 
 [features]

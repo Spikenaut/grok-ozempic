@@ -1,5 +1,33 @@
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Quantization pipeline types
+// ---------------------------------------------------------------------------
+
+/// Controls which precision is applied to a given tensor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TensorPrecision {
+    /// Two-bit ternary {-1, 0, +1} with saliency-gated GIF threshold.
+    TernarySnN,
+    /// Keep original FP16 — used for MoE routing gates.
+    Fp16,
+}
+
+/// Configuration for the out-of-core quantization pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuantizationConfig {
+    /// Directory that holds the Grok-1 Safetensors shards.
+    pub input_dir: String,
+    /// Path for the output GGUF file.
+    pub output_path: String,
+    /// GIF saliency threshold ratio: weights with |w| < threshold × rms(layer)
+    /// are silenced to 0; the rest become ±1.
+    pub gif_threshold: f32,
+    /// Tensor name substrings that identify routing / gate tensors which should
+    /// remain in FP16 instead of being ternary-quantized.
+    pub router_patterns: Vec<String>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
     pub gpu_temp_c: f32,

@@ -16,6 +16,12 @@ pub enum GrokOzempicError {
 
     #[error("expert index {index} out of range (num_experts={num_experts})")]
     ExpertOutOfRange { index: usize, num_experts: usize },
+
+    #[error("quantization error: {0}")]
+    Quantization(String),
+
+    #[error("GGUF write error: {0}")]
+    GgufWrite(String),
 }
 
 pub type Result<T> = std::result::Result<T, GrokOzempicError>;

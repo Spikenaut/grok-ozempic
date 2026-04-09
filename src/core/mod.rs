@@ -1,5 +1,8 @@
+pub mod gguf;
 pub mod olmoe;
 pub mod projector;
+pub mod quantizer;
+pub mod stream;
 
 use crate::{
     error::Result,
