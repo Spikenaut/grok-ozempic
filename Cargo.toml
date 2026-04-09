@@ -1,0 +1,21 @@
+[package]
+name = "grok-ozempic"
+version = "0.1.0"
+edition = "2024"
+description = "SNN-logic quantization for Grok models — turning fat into spikes"
+repository = "https://github.com/Spikenaut/grok-ozempic"
+license = "GPL-3.0-or-later"
+keywords = ["snn", "spiking", "quantization", "moe", "grok"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+safetensors = "0.4"          # for direct safetensors support (Grok raw weights)
+tokio = { version = "1.0", features = ["full"], optional = true }  # future async loading
+
+[features]
+default = []
+gguf = []                    # future GGUF support if needed
+async = ["tokio"]
