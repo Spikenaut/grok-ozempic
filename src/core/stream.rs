@@ -2,14 +2,14 @@
 //!
 //! 1. **Manifest pass** — scans safetensors shards or `.npy` files and records
 //!    only `(path, name, shape, dtype, router?)` (no weight payloads).
-//! 2. **Header pass** — writes GGUF metadata + tensor info with placeholder
-//!    offsets via [`GgufStreamWriter::begin`].
+//! 2. **Header pass** — writes **GOZ1** metadata + tensor table with placeholder
+//!    offsets via [`PackStreamWriter::begin`](crate::core::weight_pack::PackStreamWriter::begin).
 //! 3. **Data pass** — for each manifest row, memory-maps the source tensor,
 //!    quantizes **one tensor at a time**, and streams bytes with
-//!    [`GgufStreamWriter::write_tensor_data`] (no accumulation of all tensors).
+//!    [`PackStreamWriter::write_tensor_data`](crate::core::weight_pack::PackStreamWriter::write_tensor_data).
 //!
-//! Pickle / pure JAX checkpoints are not read here; convert to safetensors or
-//! `.npy` first.
+//! **JAX / Flax** checkpoints are not read directly; export tensors to **`.npy`**
+//! (or **safetensors**) first. Python **pickle** is not supported.
 
 use std::{
     collections::BTreeMap,
@@ -24,9 +24,8 @@ use safetensors::SafeTensors;
 
 use crate::{
     core::{
-        gguf::{
-            GgufMetaValue, GgufStreamWriter, TensorHeader, GGUF_TENSOR_TYPE_F16,
-            GGUF_TENSOR_TYPE_TERNARY,
+        weight_pack::{
+            PackMetaValue, PackStreamWriter, PackTensorHeader, TENSOR_F16, TENSOR_TERNARY,
         },
         npy::{npy_stem_to_tensor_name, MmapNpy, NpyDtype},
         quantizer::{convert_f32_to_f16_bytes, passthrough_f16, quantize_f16, quantize_f32},
@@ -35,49 +34,50 @@ use crate::{
     types::{QuantizationConfig, QuantizationInputFormat},
 };
 
-// Grok-1 architecture hints for downstream loaders (llama.cpp-style keys).
-// Confirm against https://huggingface.co/xai-org/grok-1 `config.json` when updating.
+// Grok-1 (JAX) architecture hints embedded in GOZ1 metadata — confirm against
+// https://huggingface.co/xai-org/grok-1 `config.json` when updating.
 const GROK1_CONTEXT_LENGTH: u32 = 8192;
 const GROK1_EMBEDDING_LENGTH: u32 = 6144;
 const GROK1_FEED_FORWARD_LENGTH: u32 = 32768;
 const GROK1_ATTENTION_HEAD_COUNT: u32 = 48;
 const GROK1_ATTENTION_HEAD_COUNT_KV: u32 = 8;
 const GROK1_BLOCK_COUNT: u32 = 64;
-const GROK1_EXPERT_COUNT: u32 = 256;
+/// MoE experts **per layer** (matches HF Grok-1 and [`crate::types::HybridConfig`] defaults).
+const GROK1_EXPERT_COUNT: u32 = 8;
 
-/// Append Grok-1-ish architecture metadata so GGUF consumers can size the graph.
-pub fn append_grok1_arch_metadata(meta: &mut BTreeMap<String, GgufMetaValue>) {
+/// Append Grok-1 model shape hints into GOZ1 metadata (for your own loaders / JAX tooling).
+pub fn append_grok1_arch_metadata(meta: &mut BTreeMap<String, PackMetaValue>) {
     meta.insert(
-        "general.architecture".into(),
-        GgufMetaValue::Str("grok".into()),
+        "grok1.architecture".into(),
+        PackMetaValue::Str("grok-1".into()),
     );
     meta.insert(
-        "grok.context_length".into(),
-        GgufMetaValue::U32(GROK1_CONTEXT_LENGTH),
+        "grok1.context_length".into(),
+        PackMetaValue::U32(GROK1_CONTEXT_LENGTH),
     );
     meta.insert(
-        "grok.embedding_length".into(),
-        GgufMetaValue::U32(GROK1_EMBEDDING_LENGTH),
+        "grok1.embedding_length".into(),
+        PackMetaValue::U32(GROK1_EMBEDDING_LENGTH),
     );
     meta.insert(
-        "grok.feed_forward_length".into(),
-        GgufMetaValue::U32(GROK1_FEED_FORWARD_LENGTH),
+        "grok1.feed_forward_length".into(),
+        PackMetaValue::U32(GROK1_FEED_FORWARD_LENGTH),
     );
     meta.insert(
-        "grok.attention.head_count".into(),
-        GgufMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT),
+        "grok1.attention.head_count".into(),
+        PackMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT),
     );
     meta.insert(
-        "grok.attention.head_count_kv".into(),
-        GgufMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT_KV),
+        "grok1.attention.head_count_kv".into(),
+        PackMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT_KV),
     );
     meta.insert(
-        "grok.block_count".into(),
-        GgufMetaValue::U32(GROK1_BLOCK_COUNT),
+        "grok1.block_count".into(),
+        PackMetaValue::U32(GROK1_BLOCK_COUNT),
     );
     meta.insert(
-        "grok.expert_count".into(),
-        GgufMetaValue::U32(GROK1_EXPERT_COUNT),
+        "grok1.expert_count".into(),
+        PackMetaValue::U32(GROK1_EXPERT_COUNT),
     );
 }
 
@@ -178,38 +178,38 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         ));
     }
 
-    let headers: Vec<TensorHeader> = manifest
+    let headers: Vec<PackTensorHeader> = manifest
         .iter()
-        .map(|e| TensorHeader {
+        .map(|e| PackTensorHeader {
             name: e.tensor_name.clone(),
             shape: e.shape.clone(),
             tensor_type: if e.is_router {
-                GGUF_TENSOR_TYPE_F16
+                TENSOR_F16
             } else {
-                GGUF_TENSOR_TYPE_TERNARY
+                TENSOR_TERNARY
             },
         })
         .collect();
 
-    let mut metadata: BTreeMap<String, GgufMetaValue> = BTreeMap::new();
+    let mut metadata: BTreeMap<String, PackMetaValue> = BTreeMap::new();
     metadata.insert(
-        "general.name".into(),
-        GgufMetaValue::Str("grok-ozempic".into()),
+        "oz.name".into(),
+        PackMetaValue::Str("grok-ozempic".into()),
     );
     metadata.insert(
-        "general.quantization_version".into(),
-        GgufMetaValue::U32(1),
+        "oz.quantization_version".into(),
+        PackMetaValue::U32(1),
     );
     metadata.insert(
-        "grok_ozempic.gif_threshold".into(),
-        GgufMetaValue::Str(config.gif_threshold.to_string()),
+        "oz.gif_threshold".into(),
+        PackMetaValue::Str(config.gif_threshold.to_string()),
     );
     append_grok1_arch_metadata(&mut metadata);
 
     let out_file = File::create(&config.output_path).map_err(GrokOzempicError::Io)?;
     let mut out_writer = BufWriter::new(out_file);
 
-    let mut stream = GgufStreamWriter::begin(&mut out_writer, &metadata, &headers)?;
+    let mut stream = PackStreamWriter::begin(&mut out_writer, &metadata, &headers)?;
 
     let mut all_stats: Vec<ShardStats> = Vec::new();
     let mut current_path: Option<PathBuf> = None;

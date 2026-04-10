@@ -9,7 +9,7 @@ use crate::{
 ///
 /// Implements top-k gating: for each input embedding only `top_k` experts
 /// are activated, everything else is zeroed out.
-pub struct OLMoE {
+pub struct OzempicMoE {
     pub num_experts: usize,
     pub top_k: usize,
     pub embedding_dim: usize,
@@ -17,8 +17,8 @@ pub struct OLMoE {
     gate_weights: Vec<Vec<f32>>,
 }
 
-impl OLMoE {
-    /// Create a new `OLMoE` with zero-initialised gate weights (uniform routing
+impl OzempicMoE {
+    /// Create a new `OzempicMoE` with zero-initialised gate weights (uniform routing
     /// until you call [`Self::load_gates_from_fp16_stacked_experts`] with real
     /// router / gate tensors).
     pub fn new(num_experts: usize, top_k: usize, embedding_dim: usize) -> Self {
@@ -30,7 +30,7 @@ impl OLMoE {
         }
     }
 
-    /// Build an `OLMoE` from a [`HybridConfig`].
+    /// Build an `OzempicMoE` from a [`HybridConfig`].
     pub fn from_config(config: &HybridConfig) -> Self {
         Self::new(
             config.num_experts,
@@ -42,7 +42,7 @@ impl OLMoE {
     /// Load all expert gate rows from a single FP16 blob: layout is
     /// `[num_experts × embedding_dim]` values in row-major order (each row is
     /// one expert's gate vector, little-endian IEEE half). Typical source: a
-    /// quantized Grok MoE router / gate tensor after conversion from GGUF.
+    /// quantized MoE router / gate tensor (e.g. from a GOZ1 pack or JAX `.npy`).
     pub fn load_gates_from_fp16_stacked_experts(&mut self, data: &[u8]) -> Result<()> {
         let need = self
             .num_experts

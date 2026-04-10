@@ -20,8 +20,8 @@ pub enum GrokOzempicError {
     #[error("quantization error: {0}")]
     Quantization(String),
 
-    #[error("GGUF write error: {0}")]
-    GgufWrite(String),
+    #[error("GOZ1 pack write error: {0}")]
+    PackWrite(String),
 }
 
 pub type Result<T> = std::result::Result<T, GrokOzempicError>;

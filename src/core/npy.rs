@@ -102,6 +102,7 @@ pub fn parse_npy_header(buf: &[u8]) -> Result<(NpyDtype, Vec<usize>, usize)> {
     let shape = parse_shape(header_str).ok_or_else(|| {
         GrokOzempicError::InvalidConfig("npy: could not parse shape".into())
     })?;
+    ensure_npy_c_order(header_str)?;
     let dtype = npy_descr_to_dtype(descr);
     let preamble = header_start;
     let total = preamble + header_len;
@@ -128,6 +129,28 @@ fn parse_descr(header: &str) -> Option<&str> {
     let rest = &rest[quote.len_utf8()..];
     let end = rest.find(quote)?;
     Some(&rest[..end])
+}
+
+/// NumPy `.npy` is row-major (C order) unless `fortran_order` is True; we only
+/// support C order so weights are not silently transposed during quantization.
+fn ensure_npy_c_order(header: &str) -> Result<()> {
+    for key in ["'fortran_order'", "\"fortran_order\""] {
+        let Some(i) = header.find(key) else {
+            continue;
+        };
+        let rest = &header[i + key.len()..];
+        let Some(colon) = rest.find(':') else {
+            continue;
+        };
+        let rest = rest[colon + 1..].trim_start();
+        if rest.starts_with("True") {
+            return Err(GrokOzempicError::InvalidConfig(
+                "npy: fortran_order=True (column-major) is not supported; re-save with order='C'"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_shape(header: &str) -> Option<Vec<usize>> {
@@ -198,5 +221,26 @@ mod tests {
         assert_eq!(dtype, NpyDtype::F32);
         assert_eq!(shape, vec![3, 4]);
         assert_eq!(off, data_offset);
+    }
+
+    #[test]
+    fn parse_rejects_fortran_order() {
+        let dict = "{'descr': '<f4', 'fortran_order': True, 'shape': (3, 4), }";
+        let mut header = Vec::new();
+        header.extend_from_slice(NPY_MAGIC);
+        header.push(1);
+        header.push(0);
+        let hlen = dict.len() as u16;
+        header.extend_from_slice(&hlen.to_le_bytes());
+        header.extend_from_slice(dict.as_bytes());
+        let preamble = header.len();
+        let pad = (64 - (preamble % 64)) % 64;
+        header.extend(std::iter::repeat(b' ').take(pad));
+        let err = parse_npy_header(&header).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fortran_order"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -131,8 +131,7 @@ pub fn quantize_f16(weights: &[f16], gif_threshold: f32) -> QuantizedTensor {
 /// Re-encode FP16 weights as raw bytes for mixed-precision (FP16-pass-through)
 /// tensors such as MoE routing gates.
 ///
-/// The bytes are in little-endian IEEE 754 half-precision order, matching the
-/// GGUF F16 layout.
+/// The bytes are in little-endian IEEE 754 half-precision order (same as GOZ1 `TENSOR_F16`).
 pub fn passthrough_f16(weights: &[f16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(weights.len() * 2);
     for &h in weights {

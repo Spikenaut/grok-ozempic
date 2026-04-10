@@ -12,14 +12,13 @@ readme = "README.md"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
-safetensors = "0.4"          # for direct safetensors support (Grok raw weights)
+safetensors = "0.4"          # optional HF-style shards (JAX workflows often use .npy via npy module)
 memmap2 = "0.9"              # zero-copy memory-mapped file I/O for out-of-core streaming
 half = "2.4"                 # FP16 (f16) type for mixed-precision router weights
 tokio = { version = "1.0", features = ["full"], optional = true }  # future async loading
 
 [features]
 default = []
-gguf = []                    # future GGUF support if needed
 async = ["tokio"]
 
 # Standalone crate when nested under a parent workspace (see parent Cargo.toml).

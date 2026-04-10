@@ -20,7 +20,7 @@ pub enum QuantizationInputFormat {
     /// Hugging Face–style `*.safetensors` shards (memory-mapped).
     #[default]
     Safetensors,
-    /// Directory of per-tensor `*.npy` files (NumPy; typical JAX export).
+    /// Directory of per-tensor `*.npy` files — **primary layout for JAX/Flax** (NumPy export).
     /// Use `__` in the filename stem in place of `.` in tensor names
     /// (e.g. `blk__0__weight.npy` → `blk.0.weight`).
     NpyDir,
@@ -32,7 +32,7 @@ pub enum QuantizationInputFormat {
 pub struct QuantizationConfig {
     /// Directory that holds weight shards (see [`QuantizationInputFormat`]).
     pub input_dir: String,
-    /// Path for the output GGUF file.
+    /// Path for the output **GOZ1** packed checkpoint (see `weight_pack`).
     pub output_path: String,
     /// GIF saliency threshold ratio: weights with |w| < threshold × rms(layer)
     /// are silenced to 0; the rest become ±1.
@@ -74,7 +74,7 @@ impl TelemetrySnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HybridConfig {
     #[serde(default)]
-    pub model_path: String, // path to safetensors or GGUF
+    pub model_path: String, // path to weights / GOZ1 pack as needed by your runner
     /// Hidden / embedding size (Grok-1 uses 6144).
     #[serde(default = "default_grok_embedding_dim")]
     pub embedding_dim: usize,

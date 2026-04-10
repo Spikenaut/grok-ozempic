@@ -1,7 +1,7 @@
-pub mod gguf;
-pub mod gguf_read;
+pub mod weight_pack;
+pub mod weight_pack_read;
 pub mod npy;
-pub mod olmoe;
+pub mod ozempic;
 pub mod projector;
 pub mod quantizer;
 pub mod stream;
@@ -11,22 +11,22 @@ use crate::{
     types::{ExecutionMode, HybridConfig, HybridOutput},
 };
 
-use olmoe::OLMoE;
+use ozempic::OzempicMoE;
 use projector::Projector;
 
 /// The top-level hybrid model combining SNN projection with sparse MoE routing.
 pub struct HybridModel {
     pub config: HybridConfig,
     projector: Projector,
-    olmoe: OLMoE,
+    moe: OzempicMoE,
 }
 
 impl HybridModel {
     /// Construct a `HybridModel` from a [`HybridConfig`].
     pub fn from_config(config: HybridConfig) -> Self {
         let projector = Projector::from_config(&config);
-        let olmoe = OLMoE::from_config(&config);
-        Self { config, projector, olmoe }
+        let moe = OzempicMoE::from_config(&config);
+        Self { config, projector, moe }
     }
 
     /// Reset all stateful components (membrane potentials, etc.).
@@ -50,7 +50,7 @@ impl HybridModel {
 
         let spike_train = vec![spike_train_flat];
 
-        let (selected_experts, expert_weights) = self.olmoe.route(&embedding)?;
+        let (selected_experts, expert_weights) = self.moe.route(&embedding)?;
 
         Ok(HybridOutput {
             spike_train,
