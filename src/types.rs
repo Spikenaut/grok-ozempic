@@ -13,10 +13,24 @@ pub enum TensorPrecision {
     Fp16,
 }
 
+/// Weight container layout for [`QuantizationConfig::input_dir`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizationInputFormat {
+    /// Hugging Face–style `*.safetensors` shards (memory-mapped).
+    #[default]
+    Safetensors,
+    /// Directory of per-tensor `*.npy` files (NumPy; typical JAX export).
+    /// Use `__` in the filename stem in place of `.` in tensor names
+    /// (e.g. `blk__0__weight.npy` → `blk.0.weight`).
+    NpyDir,
+}
+
 /// Configuration for the out-of-core quantization pipeline.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QuantizationConfig {
-    /// Directory that holds the Grok-1 Safetensors shards.
+    /// Directory that holds weight shards (see [`QuantizationInputFormat`]).
     pub input_dir: String,
     /// Path for the output GGUF file.
     pub output_path: String,
@@ -26,6 +40,20 @@ pub struct QuantizationConfig {
     /// Tensor name substrings that identify routing / gate tensors which should
     /// remain in FP16 instead of being ternary-quantized.
     pub router_patterns: Vec<String>,
+    /// Input layout: safetensors shards vs flat `.npy` tensors.
+    pub input_format: QuantizationInputFormat,
+}
+
+impl Default for QuantizationConfig {
+    fn default() -> Self {
+        Self {
+            input_dir: String::new(),
+            output_path: String::new(),
+            gif_threshold: 0.05,
+            router_patterns: Vec::new(),
+            input_format: QuantizationInputFormat::Safetensors,
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -45,24 +73,62 @@ impl TelemetrySnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HybridConfig {
-    pub model_path: String,           // path to safetensors or GGUF
+    #[serde(default)]
+    pub model_path: String, // path to safetensors or GGUF
+    /// Hidden / embedding size (Grok-1 uses 6144).
+    #[serde(default = "default_grok_embedding_dim")]
+    pub embedding_dim: usize,
+    #[serde(default = "default_num_experts")]
     pub num_experts: usize,
+    #[serde(default = "default_top_k_experts")]
     pub top_k_experts: usize,
+    #[serde(default = "default_snn_steps")]
     pub snn_steps: usize,
+    #[serde(default)]
     pub projection_mode: ProjectionMode,
+    #[serde(default)]
     pub execution_mode: ExecutionMode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProjectionMode {
-    SpikingTernary,   // your main mode
-    // add others later if needed
+fn default_grok_embedding_dim() -> usize {
+    GROK1_HIDDEN_DIM
+}
+fn default_num_experts() -> usize {
+    8
+}
+fn default_top_k_experts() -> usize {
+    2
+}
+fn default_snn_steps() -> usize {
+    4
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl Default for HybridConfig {
+    fn default() -> Self {
+        Self {
+            model_path: String::new(),
+            embedding_dim: GROK1_HIDDEN_DIM,
+            num_experts: 8,
+            top_k_experts: 2,
+            snn_steps: 4,
+            projection_mode: ProjectionMode::SpikingTernary,
+            execution_mode: ExecutionMode::SpikingSim,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectionMode {
+    #[default]
+    SpikingTernary, // your main mode
+                    // add others later if needed
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
-    SpikingSim,       // GIF + ternary
-    DenseSim,         // for comparison
+    #[default]
+    SpikingSim, // GIF + ternary
+    DenseSim,   // for comparison
 }
 
 #[derive(Clone, Debug)]
@@ -73,4 +139,5 @@ pub struct HybridOutput {
     pub selected_experts: Option<Vec<usize>>,
 }
 
-pub const EMBEDDING_DIM: usize = 2048;  // adjust if Grok uses different dim
+/// Grok-1 hidden size (`hidden_size` / `embedding_length` in model cards).
+pub const GROK1_HIDDEN_DIM: usize = 6144;

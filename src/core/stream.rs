@@ -1,27 +1,21 @@
-//! Out-of-Core Streaming Quantization Engine
+//! Out-of-core streaming quantization engine
 //!
-//! Implements a zero-OOM pipeline for quantizing the full 318 GB Grok-1 model
-//! on hardware with limited VRAM / system RAM:
+//! 1. **Manifest pass** — scans safetensors shards or `.npy` files and records
+//!    only `(path, name, shape, dtype, router?)` (no weight payloads).
+//! 2. **Header pass** — writes GGUF metadata + tensor info with placeholder
+//!    offsets via [`GgufStreamWriter::begin`].
+//! 3. **Data pass** — for each manifest row, memory-maps the source tensor,
+//!    quantizes **one tensor at a time**, and streams bytes with
+//!    [`GgufStreamWriter::write_tensor_data`] (no accumulation of all tensors).
 //!
-//! 1. Memory-maps each Safetensors shard read-only via `memmap2` — the OS
-//!    kernel pages in only the bytes that are actually touched.
-//! 2. For each tensor, classifies it as a **router tensor** (kept in FP16) or
-//!    an **expert MLP tensor** (ternary-quantized with GIF saliency filter).
-//! 3. Streams the quantized bytes directly into a [`GgufWriter`] buffer and
-//!    writes the final GGUF file, then drops every allocation before moving on.
-//!
-//! # Memory behaviour
-//! - The raw weight bytes are accessed through a read-only `memmap2` mapping;
-//!   no heap allocation proportional to shard size is made.
-//! - Only the f32/f16 slice for **one tensor at a time** is materialised on
-//!   the heap (for the quantizer), then dropped before the next tensor is read.
-//! - The [`GgufWriter`] accumulates only the (much smaller) packed ternary /
-//!   FP16 output data.
+//! Pickle / pure JAX checkpoints are not read here; convert to safetensors or
+//! `.npy` first.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
-    io::BufWriter,
-    path::{Path, PathBuf},
+    io::{BufWriter, Write},
+    path::PathBuf,
 };
 
 use half::f16;
@@ -30,32 +24,71 @@ use safetensors::SafeTensors;
 
 use crate::{
     core::{
-        gguf::{GgufMetaValue, GgufWriter, TensorEntry, GGUF_TENSOR_TYPE_F16, GGUF_TENSOR_TYPE_TERNARY},
+        gguf::{
+            GgufMetaValue, GgufStreamWriter, TensorHeader, GGUF_TENSOR_TYPE_F16,
+            GGUF_TENSOR_TYPE_TERNARY,
+        },
+        npy::{npy_stem_to_tensor_name, MmapNpy, NpyDtype},
         quantizer::{convert_f32_to_f16_bytes, passthrough_f16, quantize_f16, quantize_f32},
     },
     error::{GrokOzempicError, Result},
-    types::QuantizationConfig,
+    types::{QuantizationConfig, QuantizationInputFormat},
 };
+
+// Grok-1 architecture hints for downstream loaders (llama.cpp-style keys).
+// Confirm against https://huggingface.co/xai-org/grok-1 `config.json` when updating.
+const GROK1_CONTEXT_LENGTH: u32 = 8192;
+const GROK1_EMBEDDING_LENGTH: u32 = 6144;
+const GROK1_FEED_FORWARD_LENGTH: u32 = 32768;
+const GROK1_ATTENTION_HEAD_COUNT: u32 = 48;
+const GROK1_ATTENTION_HEAD_COUNT_KV: u32 = 8;
+const GROK1_BLOCK_COUNT: u32 = 64;
+const GROK1_EXPERT_COUNT: u32 = 256;
+
+/// Append Grok-1-ish architecture metadata so GGUF consumers can size the graph.
+pub fn append_grok1_arch_metadata(meta: &mut BTreeMap<String, GgufMetaValue>) {
+    meta.insert(
+        "general.architecture".into(),
+        GgufMetaValue::Str("grok".into()),
+    );
+    meta.insert(
+        "grok.context_length".into(),
+        GgufMetaValue::U32(GROK1_CONTEXT_LENGTH),
+    );
+    meta.insert(
+        "grok.embedding_length".into(),
+        GgufMetaValue::U32(GROK1_EMBEDDING_LENGTH),
+    );
+    meta.insert(
+        "grok.feed_forward_length".into(),
+        GgufMetaValue::U32(GROK1_FEED_FORWARD_LENGTH),
+    );
+    meta.insert(
+        "grok.attention.head_count".into(),
+        GgufMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT),
+    );
+    meta.insert(
+        "grok.attention.head_count_kv".into(),
+        GgufMetaValue::U32(GROK1_ATTENTION_HEAD_COUNT_KV),
+    );
+    meta.insert(
+        "grok.block_count".into(),
+        GgufMetaValue::U32(GROK1_BLOCK_COUNT),
+    );
+    meta.insert(
+        "grok.expert_count".into(),
+        GgufMetaValue::U32(GROK1_EXPERT_COUNT),
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Tensor classification
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when the tensor `name` should be kept in FP16 (router /
-/// gate weights) rather than being ternary-quantized.
-///
-/// The classification is based on substring matching against the patterns
-/// listed in [`QuantizationConfig::router_patterns`].  If no patterns are
-/// configured the default set is used (covers Grok-1's gate / router layers).
 fn is_router_tensor(name: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
-        // Default Grok-1 routing tensor name fragments.
         let defaults = [
-            "router",
-            "gate",
-            "moe_gate",
-            "expert_router",
-            "routing",
+            "router", "gate", "moe_gate", "expert_router", "routing",
         ];
         return defaults.iter().any(|p| name.contains(p));
     }
@@ -63,197 +96,334 @@ fn is_router_tensor(name: &str, patterns: &[String]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Safetensors dtype helpers
+// Source dtype (safetensors + npy)
 // ---------------------------------------------------------------------------
 
-/// Dtype tag values used by the Safetensors format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dtype {
+enum SourceDtype {
     F32,
     F16,
     BF16,
     Other,
 }
 
-fn parse_dtype(dt: safetensors::Dtype) -> Dtype {
+fn parse_safetensors_dtype(dt: safetensors::Dtype) -> SourceDtype {
     match dt {
-        safetensors::Dtype::F32 => Dtype::F32,
-        safetensors::Dtype::F16 => Dtype::F16,
-        safetensors::Dtype::BF16 => Dtype::BF16,
-        _ => Dtype::Other,
+        safetensors::Dtype::F32 => SourceDtype::F32,
+        safetensors::Dtype::F16 => SourceDtype::F16,
+        safetensors::Dtype::BF16 => SourceDtype::BF16,
+        _ => SourceDtype::Other,
+    }
+}
+
+fn npy_dtype_to_source(dt: NpyDtype) -> SourceDtype {
+    match dt {
+        NpyDtype::F32 => SourceDtype::F32,
+        NpyDtype::F16 => SourceDtype::F16,
+        NpyDtype::BF16 => SourceDtype::BF16,
+        NpyDtype::Other => SourceDtype::Other,
     }
 }
 
 // ---------------------------------------------------------------------------
-// Streaming engine
+// Manifest
 // ---------------------------------------------------------------------------
 
-/// Diagnostic statistics emitted after processing each shard.
+#[derive(Debug, Clone)]
+struct ManifestEntry {
+    source_path: PathBuf,
+    tensor_name: String,
+    shape: Vec<u64>,
+    is_router: bool,
+}
+
+/// Diagnostic statistics emitted after processing each shard / source file.
 #[derive(Debug, Default)]
 pub struct ShardStats {
     pub shard_path: PathBuf,
     pub tensors_ternary: usize,
     pub tensors_fp16: usize,
     pub tensors_skipped: usize,
-    /// Average sparsity across ternary tensors (fraction silenced to 0).
     pub avg_sparsity: f32,
 }
 
 /// Run the full out-of-core quantization pipeline described by `config`.
-///
-/// # Errors
-/// Returns an error if:
-/// - `input_dir` contains no `.safetensors` files.
-/// - Any shard cannot be memory-mapped or parsed.
-/// - The output GGUF file cannot be created or written.
 pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> {
-    // Collect shard paths, sorted for deterministic output ordering.
-    let shards = collect_shards(&config.input_dir)?;
-    if shards.is_empty() {
-        return Err(GrokOzempicError::InvalidConfig(format!(
-            "no .safetensors files found in '{}'",
-            config.input_dir
-        )));
+    let manifest = match config.input_format {
+        QuantizationInputFormat::Safetensors => {
+            let shards = collect_safetensor_shards(&config.input_dir)?;
+            if shards.is_empty() {
+                return Err(GrokOzempicError::InvalidConfig(format!(
+                    "no .safetensors files found in '{}'",
+                    config.input_dir
+                )));
+            }
+            build_manifest_safetensors(&shards, &config.router_patterns)?
+        }
+        QuantizationInputFormat::NpyDir => {
+            let paths = collect_npy_files(&config.input_dir)?;
+            if paths.is_empty() {
+                return Err(GrokOzempicError::InvalidConfig(format!(
+                    "no .npy files found in '{}'",
+                    config.input_dir
+                )));
+            }
+            build_manifest_npy(&paths, &config.router_patterns)?
+        }
+    };
+
+    if manifest.is_empty() {
+        return Err(GrokOzempicError::InvalidConfig(
+            "no quantizable tensors found (all skipped as unsupported dtype?)".into(),
+        ));
     }
 
-    // Create the output GGUF file.
+    let headers: Vec<TensorHeader> = manifest
+        .iter()
+        .map(|e| TensorHeader {
+            name: e.tensor_name.clone(),
+            shape: e.shape.clone(),
+            tensor_type: if e.is_router {
+                GGUF_TENSOR_TYPE_F16
+            } else {
+                GGUF_TENSOR_TYPE_TERNARY
+            },
+        })
+        .collect();
+
+    let mut metadata: BTreeMap<String, GgufMetaValue> = BTreeMap::new();
+    metadata.insert(
+        "general.name".into(),
+        GgufMetaValue::Str("grok-ozempic".into()),
+    );
+    metadata.insert(
+        "general.quantization_version".into(),
+        GgufMetaValue::U32(1),
+    );
+    metadata.insert(
+        "grok_ozempic.gif_threshold".into(),
+        GgufMetaValue::Str(config.gif_threshold.to_string()),
+    );
+    append_grok1_arch_metadata(&mut metadata);
+
     let out_file = File::create(&config.output_path).map_err(GrokOzempicError::Io)?;
     let mut out_writer = BufWriter::new(out_file);
 
-    let mut gguf = GgufWriter::new();
+    let mut stream = GgufStreamWriter::begin(&mut out_writer, &metadata, &headers)?;
 
-    // Write top-level metadata.
-    gguf.set_metadata("general.name", GgufMetaValue::Str("grok-ozempic".into()));
-    gguf.set_metadata(
-        "general.quantization_version",
-        GgufMetaValue::U32(1),
-    );
-    gguf.set_metadata(
-        "grok_ozempic.gif_threshold",
-        GgufMetaValue::Str(config.gif_threshold.to_string()),
-    );
+    let mut all_stats: Vec<ShardStats> = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut shard_stats = ShardStats::default();
+    let mut sparsity_sum = 0.0f32;
+    let mut sparsity_n = 0usize;
 
-    let mut all_stats: Vec<ShardStats> = Vec::with_capacity(shards.len());
+    for entry in &manifest {
+        if current_path.as_ref() != Some(&entry.source_path) {
+            if current_path.is_some() {
+                if sparsity_n > 0 {
+                    shard_stats.avg_sparsity = sparsity_sum / sparsity_n as f32;
+                }
+                all_stats.push(shard_stats);
+                sparsity_sum = 0.0;
+                sparsity_n = 0;
+            }
+            shard_stats = ShardStats {
+                shard_path: entry.source_path.clone(),
+                ..Default::default()
+            };
+            current_path = Some(entry.source_path.clone());
+        }
 
-    for shard_path in &shards {
-        let stats = process_shard(shard_path, config, &mut gguf)?;
-        all_stats.push(stats);
+        let (packed, ternary_sparsity) = quantize_manifest_entry(entry, config)?;
+        if entry.is_router {
+            shard_stats.tensors_fp16 += 1;
+        } else {
+            shard_stats.tensors_ternary += 1;
+            if let Some(sp) = ternary_sparsity {
+                sparsity_sum += sp;
+                sparsity_n += 1;
+            }
+        }
+        stream.write_tensor_data(&packed)?;
+    }
+    if current_path.is_some() {
+        if sparsity_n > 0 {
+            shard_stats.avg_sparsity = sparsity_sum / sparsity_n as f32;
+        }
+        all_stats.push(shard_stats);
     }
 
-    // Flush everything to disk.
-    gguf.finish(&mut out_writer)
-        .map_err(|e| GrokOzempicError::GgufWrite(e.to_string()))?;
+    stream.finalize()?;
+    out_writer
+        .flush()
+        .map_err(GrokOzempicError::Io)?;
 
     Ok(all_stats)
 }
 
-/// Process a single Safetensors shard: memory-map it, iterate tensors, quantize
-/// each one, and add it to the GGUF writer.
-fn process_shard(
-    shard_path: &Path,
+fn quantize_manifest_entry(
+    entry: &ManifestEntry,
     config: &QuantizationConfig,
-    gguf: &mut GgufWriter,
-) -> Result<ShardStats> {
-    let file = File::open(shard_path).map_err(GrokOzempicError::Io)?;
-
-    // Safety: we open the file read-only and do not mutate the mapping.  The
-    // file is not modified while the mapping is alive (single-threaded).
-    let mmap = unsafe { MmapOptions::new().map(&file).map_err(GrokOzempicError::Io)? };
-
-    let tensors = SafeTensors::deserialize(&mmap).map_err(GrokOzempicError::Safetensors)?;
-
-    let mut stats = ShardStats {
-        shard_path: shard_path.to_owned(),
-        ..Default::default()
-    };
-    let mut sparsity_sum = 0.0f32;
-
-    for (name, view) in tensors.tensors() {
-        let dtype = parse_dtype(view.dtype());
-        if dtype == Dtype::Other {
-            // Skip unsupported dtypes (e.g., I8, Bool) without failing.
-            stats.tensors_skipped += 1;
-            continue;
-        }
-
-        let router = is_router_tensor(&name, &config.router_patterns);
-
-        let (packed_data, tensor_type, shape) = if router {
-            // ── Mixed-precision: keep routing gate in FP16 ──────────────────
-            let fp16_bytes = match dtype {
-                Dtype::F16 => {
-                    // Already FP16 — read raw bytes directly from the mmap.
-                    let raw = view.data();
-                    let f16_slice: &[f16] = bytemuck_cast_f16(raw);
-                    passthrough_f16(f16_slice)
-                }
-                Dtype::F32 => {
-                    let raw = view.data();
-                    let f32_slice = bytemuck_cast_f32(raw);
-                    convert_f32_to_f16_bytes(f32_slice)
-                }
-                Dtype::BF16 => {
-                    // Convert BF16 → f32 → f16.
-                    let raw = view.data();
-                    let f32_vals = bf16_bytes_to_f32(raw);
-                    convert_f32_to_f16_bytes(&f32_vals)
-                }
-                Dtype::Other => unreachable!(),
-            };
-            let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
-            (fp16_bytes, GGUF_TENSOR_TYPE_F16, shape)
-        } else {
-            // ── Saliency-aware GIF ternary quantization ──────────────────────
-            let qt = match dtype {
-                Dtype::F32 => {
-                    let raw = view.data();
-                    let f32_slice = bytemuck_cast_f32(raw);
-                    quantize_f32(f32_slice, config.gif_threshold)
-                }
-                Dtype::F16 => {
-                    let raw = view.data();
-                    let f16_slice: &[f16] = bytemuck_cast_f16(raw);
-                    quantize_f16(f16_slice, config.gif_threshold)
-                }
-                Dtype::BF16 => {
-                    let raw = view.data();
-                    let f32_vals = bf16_bytes_to_f32(raw);
-                    quantize_f32(&f32_vals, config.gif_threshold)
-                }
-                Dtype::Other => unreachable!(),
-            };
-            sparsity_sum += qt.sparsity;
-            stats.tensors_ternary += 1;
-            let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
-            (qt.packed, GGUF_TENSOR_TYPE_TERNARY, shape)
-        };
-
-        if router {
-            stats.tensors_fp16 += 1;
-        }
-
-        // Add tensor to GGUF writer — the quantized bytes are small compared
-        // with the original, and the mmap bytes are not copied here.
-        gguf.add_tensor(TensorEntry {
-            name: name.to_string(),
-            shape,
-            tensor_type,
-            data: packed_data,
-        });
+) -> Result<(Vec<u8>, Option<f32>)> {
+    match config.input_format {
+        QuantizationInputFormat::Safetensors => quantize_safetensors_entry(entry, config),
+        QuantizationInputFormat::NpyDir => quantize_npy_entry(entry, config),
     }
-
-    if stats.tensors_ternary > 0 {
-        stats.avg_sparsity = sparsity_sum / stats.tensors_ternary as f32;
-    }
-
-    Ok(stats)
 }
 
-// ---------------------------------------------------------------------------
-// File discovery
-// ---------------------------------------------------------------------------
+fn quantize_safetensors_entry(
+    entry: &ManifestEntry,
+    config: &QuantizationConfig,
+) -> Result<(Vec<u8>, Option<f32>)> {
+    let file = File::open(&entry.source_path).map_err(GrokOzempicError::Io)?;
+    let mmap = unsafe { MmapOptions::new().map(&file).map_err(GrokOzempicError::Io)? };
+    let tensors = SafeTensors::deserialize(&mmap).map_err(GrokOzempicError::Safetensors)?;
+    let view = tensors.tensor(&entry.tensor_name)?;
 
-fn collect_shards(dir: &str) -> Result<Vec<PathBuf>> {
+    let dtype = parse_safetensors_dtype(view.dtype());
+    if dtype == SourceDtype::Other {
+        return Err(GrokOzempicError::InvalidConfig(format!(
+            "tensor {} has unsupported dtype",
+            entry.tensor_name
+        )));
+    }
+
+    if entry.is_router {
+        let fp16_bytes = router_fp16_bytes(dtype, view.data())?;
+        Ok((fp16_bytes, None))
+    } else {
+        let qt = match dtype {
+            SourceDtype::F32 => {
+                let f32_slice = bytemuck_cast_f32(view.data());
+                quantize_f32(f32_slice, config.gif_threshold)
+            }
+            SourceDtype::F16 => {
+                let f16_slice: &[f16] = bytemuck_cast_f16(view.data());
+                quantize_f16(f16_slice, config.gif_threshold)
+            }
+            SourceDtype::BF16 => {
+                let f32_vals = bf16_bytes_to_f32(view.data());
+                quantize_f32(&f32_vals, config.gif_threshold)
+            }
+            SourceDtype::Other => unreachable!(),
+        };
+        let sp = qt.sparsity;
+        Ok((qt.packed, Some(sp)))
+    }
+}
+
+fn quantize_npy_entry(
+    entry: &ManifestEntry,
+    config: &QuantizationConfig,
+) -> Result<(Vec<u8>, Option<f32>)> {
+    let npy = MmapNpy::map_path(&entry.source_path)?;
+    let dtype = npy_dtype_to_source(npy.dtype());
+    if dtype == SourceDtype::Other {
+        return Err(GrokOzempicError::InvalidConfig(format!(
+            "npy {} has unsupported descr",
+            entry.source_path.display()
+        )));
+    }
+    let raw = npy.data();
+
+    if entry.is_router {
+        let fp16_bytes = router_fp16_bytes(dtype, raw)?;
+        Ok((fp16_bytes, None))
+    } else {
+        let qt = match dtype {
+            SourceDtype::F32 => {
+                let f32_slice = bytemuck_cast_f32(raw);
+                quantize_f32(f32_slice, config.gif_threshold)
+            }
+            SourceDtype::F16 => {
+                let f16_slice: &[f16] = bytemuck_cast_f16(raw);
+                quantize_f16(f16_slice, config.gif_threshold)
+            }
+            SourceDtype::BF16 => {
+                let f32_vals = bf16_bytes_to_f32(raw);
+                quantize_f32(&f32_vals, config.gif_threshold)
+            }
+            SourceDtype::Other => unreachable!(),
+        };
+        let sp = qt.sparsity;
+        Ok((qt.packed, Some(sp)))
+    }
+}
+
+fn router_fp16_bytes(dtype: SourceDtype, raw: &[u8]) -> Result<Vec<u8>> {
+    let b = match dtype {
+        SourceDtype::F16 => {
+            let f16_slice: &[f16] = bytemuck_cast_f16(raw);
+            passthrough_f16(f16_slice)
+        }
+        SourceDtype::F32 => {
+            let f32_slice = bytemuck_cast_f32(raw);
+            convert_f32_to_f16_bytes(f32_slice)
+        }
+        SourceDtype::BF16 => {
+            let f32_vals = bf16_bytes_to_f32(raw);
+            convert_f32_to_f16_bytes(&f32_vals)
+        }
+        SourceDtype::Other => unreachable!(),
+    };
+    Ok(b)
+}
+
+fn build_manifest_safetensors(
+    shards: &[PathBuf],
+    patterns: &[String],
+) -> Result<Vec<ManifestEntry>> {
+    let mut v = Vec::new();
+    for shard in shards {
+        let file = File::open(shard).map_err(GrokOzempicError::Io)?;
+        let mmap = unsafe { MmapOptions::new().map(&file).map_err(GrokOzempicError::Io)? };
+        let tensors = SafeTensors::deserialize(&mmap).map_err(GrokOzempicError::Safetensors)?;
+        for (name, view) in tensors.tensors() {
+            let dtype = parse_safetensors_dtype(view.dtype());
+            if dtype == SourceDtype::Other {
+                continue;
+            }
+            let is_router = is_router_tensor(&name, patterns);
+            let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
+            v.push(ManifestEntry {
+                source_path: shard.clone(),
+                tensor_name: name,
+                shape,
+                is_router,
+            });
+        }
+    }
+    Ok(v)
+}
+
+fn build_manifest_npy(paths: &[PathBuf], patterns: &[String]) -> Result<Vec<ManifestEntry>> {
+    let mut v = Vec::new();
+    for path in paths {
+        let npy = MmapNpy::map_path(path)?;
+        let dtype = npy_dtype_to_source(npy.dtype());
+        if dtype == SourceDtype::Other {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                GrokOzempicError::InvalidConfig(format!("bad npy filename: {}", path.display()))
+            })?;
+        let tensor_name = npy_stem_to_tensor_name(stem);
+        let is_router = is_router_tensor(&tensor_name, patterns);
+        let shape: Vec<u64> = npy.shape().iter().map(|&d| d as u64).collect();
+        v.push(ManifestEntry {
+            source_path: path.clone(),
+            tensor_name,
+            shape,
+            is_router,
+        });
+    }
+    Ok(v)
+}
+
+fn collect_safetensor_shards(dir: &str) -> Result<Vec<PathBuf>> {
     let mut paths: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(GrokOzempicError::Io)?
         .filter_map(|e| e.ok())
@@ -264,53 +434,41 @@ fn collect_shards(dir: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-// ---------------------------------------------------------------------------
-// Safe byte-slice reinterpretation helpers
-// ---------------------------------------------------------------------------
+fn collect_npy_files(dir: &str) -> Result<Vec<PathBuf>> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(GrokOzempicError::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "npy"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
 
-/// Reinterpret a raw byte slice as a `&[f32]`.
-///
-/// # Panics
-/// Panics if `raw` is not aligned to 4 bytes or its length is not a multiple
-/// of 4.  Safetensors guarantees both properties for F32 tensors.
 fn bytemuck_cast_f32(raw: &[u8]) -> &[f32] {
     assert_eq!(raw.len() % 4, 0, "f32 data length must be a multiple of 4");
-    // SAFETY: safetensors guarantees the data is properly aligned and sized for
-    // the declared dtype; raw is valid for reads of raw.len() bytes.
     unsafe {
         std::slice::from_raw_parts(raw.as_ptr().cast::<f32>(), raw.len() / 4)
     }
 }
 
-/// Reinterpret a raw byte slice as a `&[f16]`.
 fn bytemuck_cast_f16(raw: &[u8]) -> &[f16] {
     assert_eq!(raw.len() % 2, 0, "f16 data length must be a multiple of 2");
-    // SAFETY: same guarantees as bytemuck_cast_f32 for F16 data.
     unsafe {
         std::slice::from_raw_parts(raw.as_ptr().cast::<f16>(), raw.len() / 2)
     }
 }
 
-/// Convert a BF16 byte slice (little-endian) to a vector of f32 values.
-///
-/// BF16 is the upper 16 bits of IEEE 754 f32; padding the lower 16 bits with
-/// zeros gives the equivalent f32.
 fn bf16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
     assert_eq!(raw.len() % 2, 0, "bf16 data length must be a multiple of 2");
     raw.chunks_exact(2)
         .map(|chunk| {
-            // BF16 little-endian: chunk[0] = low byte of BF16, chunk[1] = high byte.
-            // Reconstruct as f32 with the BF16 bits in the upper 16 bits.
             let bf16_bits = u16::from_le_bytes([chunk[0], chunk[1]]);
             let f32_bits = (bf16_bits as u32) << 16;
             f32::from_bits(f32_bits)
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -334,8 +492,6 @@ mod tests {
 
     #[test]
     fn bf16_bytes_to_f32_one() {
-        // BF16 representation of 1.0f32.
-        // 1.0f32 = 0x3F800000; top 16 bits = 0x3F80 → LE bytes [0x80, 0x3F].
         let raw = [0x80u8, 0x3F];
         let result = bf16_bytes_to_f32(&raw);
         assert_eq!(result.len(), 1);
@@ -359,7 +515,7 @@ mod tests {
 
     #[test]
     fn collect_shards_nonexistent_dir() {
-        let result = collect_shards("/tmp/nonexistent_grok_ozempic_dir_xyz");
+        let result = collect_safetensor_shards("/tmp/nonexistent_grok_ozempic_dir_xyz");
         assert!(result.is_err());
     }
 }

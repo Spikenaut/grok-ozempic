@@ -1,6 +1,6 @@
 use crate::{
     error::Result,
-    types::{HybridConfig, ProjectionMode, EMBEDDING_DIM},
+    types::{HybridConfig, ProjectionMode},
 };
 
 /// Projector maps input activations to a ternary spike representation.
@@ -30,7 +30,12 @@ impl Projector {
 
     /// Build a `Projector` from a [`HybridConfig`].
     pub fn from_config(config: &HybridConfig) -> Self {
-        Self::new(EMBEDDING_DIM, EMBEDDING_DIM, config.projection_mode, config.snn_steps)
+        Self::new(
+            config.embedding_dim,
+            config.embedding_dim,
+            config.projection_mode,
+            config.snn_steps,
+        )
     }
 
     /// Reset the membrane potentials to zero (call between independent inputs).

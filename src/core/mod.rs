@@ -1,4 +1,6 @@
 pub mod gguf;
+pub mod gguf_read;
+pub mod npy;
 pub mod olmoe;
 pub mod projector;
 pub mod quantizer;

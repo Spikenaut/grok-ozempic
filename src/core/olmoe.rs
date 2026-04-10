@@ -1,6 +1,8 @@
+use half::f16;
+
 use crate::{
     error::{GrokOzempicError, Result},
-    types::{HybridConfig, EMBEDDING_DIM},
+    types::HybridConfig,
 };
 
 /// Sparse Mixture-of-Experts router for Grok's MoE layers.
@@ -16,7 +18,9 @@ pub struct OLMoE {
 }
 
 impl OLMoE {
-    /// Create a new `OLMoE` with zero-initialised gate weights.
+    /// Create a new `OLMoE` with zero-initialised gate weights (uniform routing
+    /// until you call [`Self::load_gates_from_fp16_stacked_experts`] with real
+    /// router / gate tensors).
     pub fn new(num_experts: usize, top_k: usize, embedding_dim: usize) -> Self {
         Self {
             num_experts,
@@ -28,7 +32,43 @@ impl OLMoE {
 
     /// Build an `OLMoE` from a [`HybridConfig`].
     pub fn from_config(config: &HybridConfig) -> Self {
-        Self::new(config.num_experts, config.top_k_experts, EMBEDDING_DIM)
+        Self::new(
+            config.num_experts,
+            config.top_k_experts,
+            config.embedding_dim,
+        )
+    }
+
+    /// Load all expert gate rows from a single FP16 blob: layout is
+    /// `[num_experts × embedding_dim]` values in row-major order (each row is
+    /// one expert's gate vector, little-endian IEEE half). Typical source: a
+    /// quantized Grok MoE router / gate tensor after conversion from GGUF.
+    pub fn load_gates_from_fp16_stacked_experts(&mut self, data: &[u8]) -> Result<()> {
+        let need = self
+            .num_experts
+            .checked_mul(self.embedding_dim)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| GrokOzempicError::InvalidConfig(
+                "gate buffer size overflow".into(),
+            ))?;
+        if data.len() != need {
+            return Err(GrokOzempicError::DimensionMismatch {
+                expected: need,
+                got: data.len(),
+            });
+        }
+        self.gate_weights.clear();
+        self.gate_weights.reserve(self.num_experts);
+        for e in 0..self.num_experts {
+            let mut row = Vec::with_capacity(self.embedding_dim);
+            for i in 0..self.embedding_dim {
+                let o = (e * self.embedding_dim + i) * 2;
+                let bits = u16::from_le_bytes([data[o], data[o + 1]]);
+                row.push(f16::from_bits(bits).to_f32());
+            }
+            self.gate_weights.push(row);
+        }
+        Ok(())
     }
 
     /// Set the gate weight vector for a single expert.
