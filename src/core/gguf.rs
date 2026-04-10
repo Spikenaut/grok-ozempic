@@ -5,6 +5,12 @@
 //! - Ternary-quantized (2-bit packed) tensors.
 //! - FP16 pass-through tensors for MoE routing gates.
 //!
+//! # Streaming
+//! [`GgufStreamWriter`] writes tensor **info** with placeholder offsets, then
+//! accepts each tensor's payload **once** via [`GgufStreamWriter::write_tensor_data`]
+//! (no accumulation of all tensors in RAM). Offsets are patched in a final
+//! [`GgufStreamWriter::finalize`] pass.
+//!
 //! # GGUF format overview (v3)
 //! ```text
 //! magic            u32  = 0x46554747 ("GGUF")
@@ -34,7 +40,7 @@ const GGUF_MAGIC: u32 = 0x4655_4747;
 /// Writer targets GGUF version 3.
 const GGUF_VERSION: u32 = 3;
 /// Tensor data is aligned to this boundary in bytes.
-const DATA_ALIGNMENT: u64 = 32;
+pub const DATA_ALIGNMENT: u64 = 32;
 
 // ---------------------------------------------------------------------------
 // GGUF value type tags (GGUFMetadataValueType)
@@ -64,65 +70,49 @@ pub enum GgufMetaValue {
 }
 
 // ---------------------------------------------------------------------------
-// Tensor descriptor queued for writing
+// Tensor header (no payload — data is streamed separately)
 // ---------------------------------------------------------------------------
 
-/// Records everything needed to write one tensor's info header and data blob.
-pub struct TensorEntry {
+/// Static tensor metadata written into the GGUF info section (payload follows
+/// in the data section via [`GgufStreamWriter::write_tensor_data`]).
+#[derive(Clone, Debug)]
+pub struct TensorHeader {
     pub name: String,
     /// Shape as a list of dimensions (slowest-varying last, per GGUF spec).
     pub shape: Vec<u64>,
     pub tensor_type: u32,
-    /// Raw bytes to be written in the data section.
-    pub data: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
-// GgufWriter
+// GgufStreamWriter
 // ---------------------------------------------------------------------------
 
-/// Streaming GGUF writer.
-///
-/// Tensors are added one at a time via [`GgufWriter::add_tensor`]; the file is
-/// finalised by calling [`GgufWriter::finish`] which flushes the header (with
-/// correct byte offsets) followed by all tensor data blobs.
-pub struct GgufWriter {
-    metadata: BTreeMap<String, GgufMetaValue>,
-    tensors: Vec<TensorEntry>,
+/// Single-pass GGUF file writer: header with placeholder offsets, stream each
+/// tensor blob, then seek-back offset fix-up. Holds **no** tensor payloads.
+pub struct GgufStreamWriter<'a, W: Write + Seek> {
+    writer: &'a mut W,
+    tensor_count: usize,
+    tensors_written: usize,
+    offset_field_positions: Vec<u64>,
+    real_offsets: Vec<u64>,
+    data_section_start: u64,
 }
 
-impl GgufWriter {
-    /// Create a new, empty writer.
-    pub fn new() -> Self {
-        Self { metadata: BTreeMap::new(), tensors: Vec::new() }
-    }
-
-    /// Insert a metadata key-value pair.
-    pub fn set_metadata(&mut self, key: impl Into<String>, value: GgufMetaValue) {
-        self.metadata.insert(key.into(), value);
-    }
-
-    /// Queue a tensor for inclusion in the GGUF file.
-    pub fn add_tensor(&mut self, entry: TensorEntry) {
-        self.tensors.push(entry);
-    }
-
-    /// Write the complete GGUF file to `writer`.
-    ///
-    /// This performs two passes over the header area:
-    /// 1. Write a placeholder header with dummy offsets.
-    /// 2. Compute real data offsets from the actual header size.
-    /// 3. Seek back and rewrite tensor info with correct offsets.
-    /// 4. Pad to alignment, then stream tensor data blobs.
-    pub fn finish<W: Write + Seek>(&self, writer: &mut W) -> Result<()> {
-        // --- Pass 1: write header with placeholder offsets ---
+impl<'a, W: Write + Seek> GgufStreamWriter<'a, W> {
+    /// Write the metadata and tensor info headers (placeholder offsets), pad
+    /// to [`DATA_ALIGNMENT`], and leave the writer positioned at the start of
+    /// the tensor data section.
+    pub fn begin(
+        writer: &'a mut W,
+        metadata: &BTreeMap<String, GgufMetaValue>,
+        tensor_headers: &[TensorHeader],
+    ) -> Result<Self> {
         write_u32(writer, GGUF_MAGIC)?;
         write_u32(writer, GGUF_VERSION)?;
-        write_u64(writer, self.tensors.len() as u64)?;
-        write_u64(writer, self.metadata.len() as u64)?;
+        write_u64(writer, tensor_headers.len() as u64)?;
+        write_u64(writer, metadata.len() as u64)?;
 
-        // Metadata KV entries.
-        for (key, value) in &self.metadata {
+        for (key, value) in metadata {
             write_gguf_string(writer, key)?;
             match value {
                 GgufMetaValue::U32(v) => {
@@ -136,56 +126,82 @@ impl GgufWriter {
             }
         }
 
-        // Tensor info entries — record the position of each offset field so we
-        // can seek back and fix it up in pass 2.
-        let mut offset_positions: Vec<u64> = Vec::with_capacity(self.tensors.len());
-        for entry in &self.tensors {
+        let mut offset_field_positions: Vec<u64> = Vec::with_capacity(tensor_headers.len());
+        for entry in tensor_headers {
             write_gguf_string(writer, &entry.name)?;
             write_u32(writer, entry.shape.len() as u32)?;
             for &dim in &entry.shape {
                 write_u64(writer, dim)?;
             }
             write_u32(writer, entry.tensor_type)?;
-            // Placeholder offset — we'll overwrite this in pass 2.
-            offset_positions.push(writer.stream_position().map_err(GrokOzempicError::Io)?);
+            offset_field_positions.push(writer.stream_position().map_err(GrokOzempicError::Io)?);
             write_u64(writer, 0u64)?;
         }
 
-        // --- Alignment padding before data section ---
         let header_end = writer.stream_position().map_err(GrokOzempicError::Io)?;
         let padding_needed = (DATA_ALIGNMENT - (header_end % DATA_ALIGNMENT)) % DATA_ALIGNMENT;
-        let zeroes = vec![0u8; padding_needed as usize];
-        writer.write_all(&zeroes).map_err(GrokOzempicError::Io)?;
+        writer
+            .write_all(&vec![0u8; padding_needed as usize])
+            .map_err(GrokOzempicError::Io)?;
 
         let data_section_start = writer.stream_position().map_err(GrokOzempicError::Io)?;
 
-        // --- Pass 2: write tensor data and record real offsets ---
-        let mut real_offsets: Vec<u64> = Vec::with_capacity(self.tensors.len());
-        for entry in &self.tensors {
-            let pos = writer.stream_position().map_err(GrokOzempicError::Io)?;
-            real_offsets.push(pos - data_section_start);
-            writer.write_all(&entry.data).map_err(GrokOzempicError::Io)?;
-            // Align after each tensor blob.
-            let cur = writer.stream_position().map_err(GrokOzempicError::Io)?;
-            let pad = (DATA_ALIGNMENT - (cur % DATA_ALIGNMENT)) % DATA_ALIGNMENT;
-            writer.write_all(&vec![0u8; pad as usize]).map_err(GrokOzempicError::Io)?;
-        }
+        Ok(Self {
+            writer,
+            tensor_count: tensor_headers.len(),
+            tensors_written: 0,
+            offset_field_positions,
+            real_offsets: Vec::with_capacity(tensor_headers.len()),
+            data_section_start,
+        })
+    }
 
-        // --- Seek back and fix up offsets in tensor info headers ---
-        for (offset_pos, real_offset) in offset_positions.iter().zip(real_offsets.iter()) {
-            writer
-                .seek(SeekFrom::Start(*offset_pos))
-                .map_err(GrokOzempicError::Io)?;
-            write_u64(writer, *real_offset)?;
+    /// Append one tensor's raw bytes (quantized payload) in tensor-header order.
+    pub fn write_tensor_data(&mut self, data: &[u8]) -> Result<()> {
+        if self.tensors_written >= self.tensor_count {
+            return Err(GrokOzempicError::GgufWrite(
+                "write_tensor_data: more blobs than tensor headers".into(),
+            ));
         }
-
+        let pos = self.writer.stream_position().map_err(GrokOzempicError::Io)?;
+        self.real_offsets.push(pos - self.data_section_start);
+        self.writer.write_all(data).map_err(GrokOzempicError::Io)?;
+        let cur = self.writer.stream_position().map_err(GrokOzempicError::Io)?;
+        let pad = (DATA_ALIGNMENT - (cur % DATA_ALIGNMENT)) % DATA_ALIGNMENT;
+        self.writer
+            .write_all(&vec![0u8; pad as usize])
+            .map_err(GrokOzempicError::Io)?;
+        self.tensors_written += 1;
         Ok(())
     }
-}
 
-impl Default for GgufWriter {
-    fn default() -> Self {
-        Self::new()
+    /// Patch tensor offset fields and ensure blob count matches headers.
+    pub fn finalize(self) -> Result<()> {
+        if self.tensors_written != self.tensor_count {
+            return Err(GrokOzempicError::GgufWrite(format!(
+                "finalize: expected {} tensor blobs, got {}",
+                self.tensor_count, self.tensors_written
+            )));
+        }
+        if self.real_offsets.len() != self.offset_field_positions.len() {
+            return Err(GrokOzempicError::GgufWrite(
+                "internal: offset bookkeeping mismatch".into(),
+            ));
+        }
+        for (offset_pos, real_offset) in self
+            .offset_field_positions
+            .iter()
+            .zip(self.real_offsets.iter())
+        {
+            self.writer
+                .seek(SeekFrom::Start(*offset_pos))
+                .map_err(GrokOzempicError::Io)?;
+            write_u64(self.writer, *real_offset)?;
+        }
+        self.writer
+            .seek(SeekFrom::End(0))
+            .map_err(GrokOzempicError::Io)?;
+        Ok(())
     }
 }
 
@@ -217,66 +233,88 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn make_writer_with_one_tensor() -> (GgufWriter, TensorEntry) {
-        let mut gw = GgufWriter::new();
-        gw.set_metadata("general.name", GgufMetaValue::Str("grok-ozempic-test".into()));
-        gw.set_metadata("general.quantization_version", GgufMetaValue::U32(1));
-
-        let entry = TensorEntry {
-            name: "blk.0.ffn_gate.weight".to_string(),
-            shape: vec![64, 32],
-            tensor_type: GGUF_TENSOR_TYPE_TERNARY,
-            data: vec![0xAB; 64], // dummy packed data
-        };
-        (gw, entry)
+    fn sample_metadata() -> BTreeMap<String, GgufMetaValue> {
+        let mut m = BTreeMap::new();
+        m.insert("general.name".into(), GgufMetaValue::Str("grok-ozempic-test".into()));
+        m.insert("general.quantization_version".into(), GgufMetaValue::U32(1));
+        m
     }
 
     #[test]
-    fn write_and_check_magic() {
-        let (mut gw, entry) = make_writer_with_one_tensor();
-        gw.add_tensor(entry);
+    fn stream_writer_magic_and_version() {
+        let headers = vec![TensorHeader {
+            name: "blk.0.ffn_gate.weight".into(),
+            shape: vec![64, 32],
+            tensor_type: GGUF_TENSOR_TYPE_TERNARY,
+        }];
+        let meta = sample_metadata();
         let mut buf = Cursor::new(Vec::<u8>::new());
-        gw.finish(&mut buf).unwrap();
-
+        {
+            let mut w = GgufStreamWriter::begin(&mut buf, &meta, &headers).unwrap();
+            w.write_tensor_data(&vec![0xAB; 64]).unwrap();
+            w.finalize().unwrap();
+        }
         let bytes = buf.into_inner();
-        assert!(bytes.len() > 16, "output is too short");
-        // First 4 bytes must be GGUF magic in little-endian.
-        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         assert_eq!(magic, GGUF_MAGIC);
-        // Next 4 bytes: version = 3.
-        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         assert_eq!(version, 3);
     }
 
     #[test]
-    fn tensor_count_is_correct() {
-        let (mut gw, entry) = make_writer_with_one_tensor();
-        gw.add_tensor(entry);
+    fn stream_writer_tensor_count() {
+        let headers = vec![TensorHeader {
+            name: "t".into(),
+            shape: vec![1],
+            tensor_type: GGUF_TENSOR_TYPE_F16,
+        }];
+        let meta = sample_metadata();
         let mut buf = Cursor::new(Vec::<u8>::new());
-        gw.finish(&mut buf).unwrap();
+        {
+            let mut w = GgufStreamWriter::begin(&mut buf, &meta, &headers).unwrap();
+            w.write_tensor_data(&[0u8; 2]).unwrap();
+            w.finalize().unwrap();
+        }
         let bytes = buf.into_inner();
-        // Bytes 8-15: tensor_count u64.
         let tc = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         assert_eq!(tc, 1);
     }
 
     #[test]
-    fn data_section_is_aligned() {
-        let (mut gw, entry) = make_writer_with_one_tensor();
-        gw.add_tensor(entry);
+    fn stream_writer_two_tensors_no_payload_buffering() {
+        let headers = vec![
+            TensorHeader {
+                name: "a".into(),
+                shape: vec![2],
+                tensor_type: GGUF_TENSOR_TYPE_TERNARY,
+            },
+            TensorHeader {
+                name: "b".into(),
+                shape: vec![4],
+                tensor_type: GGUF_TENSOR_TYPE_F16,
+            },
+        ];
+        let meta = sample_metadata();
         let mut buf = Cursor::new(Vec::<u8>::new());
-        gw.finish(&mut buf).unwrap();
-        // The file must be non-empty and the total length a multiple of DATA_ALIGNMENT
-        // (because we pad after each tensor blob).
+        {
+            let mut w = GgufStreamWriter::begin(&mut buf, &meta, &headers).unwrap();
+            w.write_tensor_data(&[1, 2]).unwrap();
+            w.write_tensor_data(&[0u8; 8]).unwrap();
+            w.finalize().unwrap();
+        }
         let len = buf.into_inner().len() as u64;
-        assert_eq!(len % DATA_ALIGNMENT, 0, "file length not aligned to {DATA_ALIGNMENT}");
+        assert_eq!(len % DATA_ALIGNMENT, 0);
     }
 
     #[test]
-    fn empty_writer_produces_valid_header() {
-        let gw = GgufWriter::new();
+    fn stream_writer_empty_tensors() {
+        let headers: Vec<TensorHeader> = vec![];
+        let meta = sample_metadata();
         let mut buf = Cursor::new(Vec::<u8>::new());
-        gw.finish(&mut buf).unwrap();
+        {
+            let w = GgufStreamWriter::begin(&mut buf, &meta, &headers).unwrap();
+            w.finalize().unwrap();
+        }
         let bytes = buf.into_inner();
         let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         assert_eq!(magic, GGUF_MAGIC);
