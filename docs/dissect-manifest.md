@@ -79,12 +79,17 @@ legacy field remains supported only for the manifest-less fallback path.
 
 ### Name matching
 
-- Exact tensor names or simple globs with `*` matching one or more dotted
-  segments (e.g. `blk.*.attn_router.weight`).
+- Exact tensor names or simple globs where `*` matches **exactly one**
+  dotted segment (e.g. `blk.*.attn_router.weight` matches
+  `blk.0.attn_router.weight` but **not**
+  `blk.0.sub.attn_router.weight`).
+- Matching is anchored at dotted segments. The pattern and the tensor
+  name must have the same segment count; each segment must equal `*` or
+  match the literal.
 - **No regular expressions in v1.**
-- `gate` substring matches are intentionally not performed; globs must be
-  anchored at dotted segments to avoid the historical `ffn_gate` false
-  positive.
+- `gate` substring matches are intentionally not performed; this is why
+  globs must be segment-anchored. Historical false positives like
+  `ffn_gate` being swept up by a `gate` substring are impossible in v1.
 
 ### Precision tiers (v1)
 

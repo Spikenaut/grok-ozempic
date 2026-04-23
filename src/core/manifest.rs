@@ -8,15 +8,30 @@
 //!
 //! See `docs/dissect-manifest.md` for the full schema description.
 //!
-//! Phase 1 (this module) is **ingestion only**. The batch pipeline in
-//! [`crate::core::stream`] is not rewired yet; selection and precision
-//! seams land in a follow-up PR.
+//! This module handles **ingestion only**: JSON parsing, schema
+//! validation, and caching of the embedded Grok-1 fallback. The
+//! pipeline-side wiring (tensor classification and precision policy)
+//! lives in [`crate::core::selection`] and [`crate::core::precision`].
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{GrokOzempicError, Result};
+
+/// The in-tree, non-authoritative reference manifest for Grok-1 embedded
+/// into the binary at build time.
+///
+/// Used as the last-resort fallback by the manifest precedence chain in
+/// [`crate::core::stream`] when neither
+/// [`crate::types::QuantizationConfig::manifest_path`] nor the
+/// `GROK_OZEMPIC_MANIFEST` environment variable is set. Parsed exactly
+/// once per process via [`embedded_grok1_baseline`].
+///
+/// `xai-dissect` remains the authoritative source of truth; this constant
+/// is a bootstrapping convenience.
+pub const GROK1_BASELINE_JSON: &str =
+    include_str!("../../dissect/grok-1/baseline.json");
 
 /// Schema version understood by this loader.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -107,8 +122,9 @@ pub struct ManifestDefaults {
 /// An entry in the `preserve` list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreserveEntry {
-    /// Exact tensor name or simple glob (`*` matches one or more dotted
-    /// segments).
+    /// Exact tensor name or simple glob where `*` matches **exactly one**
+    /// dotted segment. See `docs/dissect-manifest.md` for the full
+    /// matching rules.
     pub name: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -166,10 +182,18 @@ pub fn load_manifest(path: &Path) -> Result<DissectManifest> {
         path: path.display().to_string(),
         source: e,
     })?;
+    parse_manifest_bytes(&bytes, &path.display().to_string())
+}
 
+/// Parse and validate a manifest from already-loaded bytes.
+///
+/// Shared validation path used by [`load_manifest`] (filesystem) and
+/// [`embedded_grok1_baseline`] (`include_str!`). The `label` is used in
+/// error messages to identify the origin of the bytes.
+pub fn parse_manifest_bytes(bytes: &[u8], label: &str) -> Result<DissectManifest> {
     let manifest: DissectManifest =
-        serde_json::from_slice(&bytes).map_err(|e| GrokOzempicError::ManifestParse {
-            path: path.display().to_string(),
+        serde_json::from_slice(bytes).map_err(|e| GrokOzempicError::ManifestParse {
+            path: label.to_string(),
             source: e,
         })?;
 
@@ -187,7 +211,75 @@ pub fn load_manifest(path: &Path) -> Result<DissectManifest> {
         });
     }
 
+    // Validate defaults.precision eagerly so a malformed manifest always
+    // hard-fails regardless of which tensors are actually processed. Without
+    // this check an invalid string would only surface when a tensor falls
+    // through to the Default class — a coverage-dependent, non-deterministic
+    // failure mode.
+    if let Some(ref p) = manifest.defaults.precision {
+        match p.as_str() {
+            "ternary_snn" | "fp16" | "preserve" => {}
+            other => {
+                return Err(GrokOzempicError::ManifestInvalidPrecision {
+                    got: other.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(manifest)
+}
+
+/// Return the embedded Grok-1 reference manifest, parsed lazily on first
+/// call and cached for the remainder of the process.
+///
+/// The underlying JSON is compiled into the binary from
+/// `dissect/grok-1/baseline.json` via [`GROK1_BASELINE_JSON`]. If parsing
+/// ever fails (which would require the CI guard to regress), the error is
+/// returned on every call; parsing is not retried.
+pub fn embedded_grok1_baseline() -> Result<&'static DissectManifest> {
+    static CACHE: OnceLock<std::result::Result<DissectManifest, GrokOzempicError>> =
+        OnceLock::new();
+    match CACHE.get_or_init(|| {
+        parse_manifest_bytes(
+            GROK1_BASELINE_JSON.as_bytes(),
+            "<embedded grok-1 baseline>",
+        )
+    }) {
+        Ok(m) => Ok(m),
+        Err(e) => Err(clone_typed_error(e)),
+    }
+}
+
+/// Clone a [`GrokOzempicError`] for cases where we hand shared refs out
+/// of a [`OnceLock`] but still want owned typed errors on the caller side.
+///
+/// Only the subset of variants that [`parse_manifest_bytes`] can produce
+/// needs real logic; everything else falls through to a best-effort
+/// stringified [`GrokOzempicError::InvalidConfig`].
+fn clone_typed_error(e: &GrokOzempicError) -> GrokOzempicError {
+    match e {
+        GrokOzempicError::ManifestParse { path, source: _ } => {
+            GrokOzempicError::InvalidConfig(format!(
+                "embedded grok-1 baseline parse error at {path}"
+            ))
+        }
+        GrokOzempicError::ManifestSchemaVersion { got, expected } => {
+            GrokOzempicError::ManifestSchemaVersion {
+                got: *got,
+                expected: *expected,
+            }
+        }
+        GrokOzempicError::ManifestNameConventionMismatch { got, expected } => {
+            GrokOzempicError::ManifestNameConventionMismatch {
+                got: got.clone(),
+                expected: expected.clone(),
+            }
+        }
+        other => GrokOzempicError::InvalidConfig(format!(
+            "embedded grok-1 baseline failed to load: {other}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +430,34 @@ mod tests {
     }
 
     #[test]
+    fn embedded_grok1_baseline_loads_and_caches() {
+        // Ensures include_str!-embedded baseline parses via the shared
+        // parse_manifest_bytes path and that OnceLock caches the result.
+        let a = embedded_grok1_baseline().expect("embedded baseline must load");
+        let b = embedded_grok1_baseline().expect("embedded baseline must load (2nd call)");
+        assert!(std::ptr::eq(a, b), "OnceLock must return the same ref");
+        assert_eq!(a.schema_version, MANIFEST_SCHEMA_VERSION);
+        assert_eq!(a.model.family, "grok-1");
+    }
+
+    #[test]
+    fn parse_manifest_bytes_rejects_bad_version() {
+        let json = br#"{
+            "schema": "xai-dissect.manifest",
+            "schema_version": 99,
+            "model": {
+                "family": "grok-1",
+                "tensor_name_convention": "blk.{L}.{role}.weight"
+            }
+        }"#;
+        let err = parse_manifest_bytes(json, "<test>").unwrap_err();
+        assert!(
+            matches!(err, GrokOzempicError::ManifestSchemaVersion { got: 99, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn malformed_json_is_parse_error() {
         let path = write_tmp("malformed", "{ not valid json");
         let err = load_manifest(&path).unwrap_err();
@@ -346,5 +466,32 @@ mod tests {
             "expected ManifestParse, got {err:?}"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// Regression guard for the eager defaults.precision validation:
+    /// a manifest with an invalid precision string must always hard-fail
+    /// at parse time regardless of which tensors are present.
+    #[test]
+    fn invalid_defaults_precision_is_rejected_at_parse_time() {
+        let json = br#"{
+            "schema": "xai-dissect.manifest",
+            "schema_version": 1,
+            "model": {
+                "family": "grok-1",
+                "tensor_name_convention": "blk.{L}.{role}.weight"
+            },
+            "defaults": { "precision": "bogus_tier" },
+            "preserve": [ { "name": "blk.*.*.weight" } ]
+        }"#;
+        // All tensors would be covered by the preserve glob, but the
+        // invalid precision string must still fail at parse time.
+        let err = parse_manifest_bytes(json, "<test>").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GrokOzempicError::ManifestInvalidPrecision { ref got } if got == "bogus_tier"
+            ),
+            "expected ManifestInvalidPrecision(bogus_tier), got {err:?}"
+        );
     }
 }

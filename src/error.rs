@@ -44,6 +44,9 @@ pub enum GrokOzempicError {
         "manifest tensor_name_convention mismatch: got {got:?}, expected {expected:?}"
     )]
     ManifestNameConventionMismatch { got: String, expected: String },
+
+    #[error("unsupported manifest precision tier: {got:?}")]
+    ManifestInvalidPrecision { got: String },
 }
 
 pub type Result<T> = std::result::Result<T, GrokOzempicError>;

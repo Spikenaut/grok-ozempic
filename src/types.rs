@@ -73,10 +73,20 @@ pub struct QuantizationConfig {
     /// modules.
     ///
     /// Precedence (phase 2+): this explicit path > `GROK_OZEMPIC_MANIFEST`
-    /// env var > in-tree `dissect/grok-1/baseline.json` fallback > legacy
+    /// env var > in-tree `dissect/grok-1/baseline.json` fallback (only
+    /// when [`Self::use_embedded_baseline`] is `true`) > legacy
     /// `router_patterns` heuristic.
     #[serde(default)]
     pub manifest_path: Option<PathBuf>,
+    /// Opt in to the compiled-in non-authoritative Grok-1 baseline
+    /// manifest as a fallback when neither
+    /// [`Self::manifest_path`] nor `GROK_OZEMPIC_MANIFEST` is set.
+    ///
+    /// Default is `false` so upgrading from phase 1 preserves existing
+    /// legacy-heuristic behavior. Set to `true` for a Grok-1 export to
+    /// pick up the reference manifest without pointing at a file.
+    #[serde(default)]
+    pub use_embedded_baseline: bool,
 }
 
 impl Default for QuantizationConfig {
@@ -88,6 +98,7 @@ impl Default for QuantizationConfig {
             router_patterns: Vec::new(),
             input_format: QuantizationInputFormat::Safetensors,
             manifest_path: None,
+            use_embedded_baseline: false,
         }
     }
 }

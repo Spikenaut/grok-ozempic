@@ -3,8 +3,10 @@ pub mod weight_pack_read;
 pub mod manifest;
 pub mod npy;
 pub mod ozempic;
+pub mod precision;
 pub mod projector;
 pub mod quantizer;
+pub mod selection;
 pub mod stream;
 
 use crate::{

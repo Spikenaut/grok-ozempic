@@ -24,14 +24,17 @@ use safetensors::SafeTensors;
 
 use crate::{
     core::{
+        manifest::{embedded_grok1_baseline, load_manifest, DissectManifest},
+        npy::{npy_stem_to_tensor_name, MmapNpy, NpyDtype},
+        precision::decide as precision_decide,
+        quantizer::{convert_f32_to_f16_bytes, passthrough_f16, quantize_f16, quantize_f32},
+        selection::{classify, TensorClass},
         weight_pack::{
             PackMetaValue, PackStreamWriter, PackTensorHeader, TENSOR_F16, TENSOR_TERNARY,
         },
-        npy::{npy_stem_to_tensor_name, MmapNpy, NpyDtype},
-        quantizer::{convert_f32_to_f16_bytes, passthrough_f16, quantize_f16, quantize_f32},
     },
     error::{GrokOzempicError, Result},
-    types::{QuantizationConfig, QuantizationInputFormat},
+    types::{QuantizationConfig, QuantizationInputFormat, TensorPrecision},
 };
 
 // Grok-1 (JAX) architecture hints embedded in GOZ1 metadata — confirm against
@@ -82,17 +85,66 @@ pub fn append_grok1_arch_metadata(meta: &mut BTreeMap<String, PackMetaValue>) {
 }
 
 // ---------------------------------------------------------------------------
-// Tensor classification
+// Manifest resolution & deprecation warning
 // ---------------------------------------------------------------------------
 
-fn is_router_tensor(name: &str, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        let defaults = [
-            "router", "gate", "moe_gate", "expert_router", "routing",
-        ];
-        return defaults.iter().any(|p| name.contains(p));
+/// Environment variable consulted when [`QuantizationConfig::manifest_path`]
+/// is `None`.
+pub const MANIFEST_ENV_VAR: &str = "GROK_OZEMPIC_MANIFEST";
+
+/// Resolve the xai-dissect manifest that governs this `run_quantization`
+/// call.
+///
+/// Precedence (first hit wins, errors bubble; no silent fallthrough):
+///
+/// 1. [`QuantizationConfig::manifest_path`] (explicit caller override).
+/// 2. `GROK_OZEMPIC_MANIFEST` environment variable.
+/// 3. Embedded Grok-1 baseline via [`embedded_grok1_baseline`], but
+///    **only** when [`QuantizationConfig::use_embedded_baseline`] is
+///    `true`. This is opt-in so upgrading from phase 1 does not
+///    silently apply a Grok-1 manifest to non-Grok-1 exports.
+/// 4. `None` — selection falls back to the legacy heuristic in
+///    [`crate::core::selection::classify`].
+fn resolve_manifest(config: &QuantizationConfig) -> Result<Option<DissectManifest>> {
+    if let Some(path) = &config.manifest_path {
+        return Ok(Some(load_manifest(path)?));
     }
-    patterns.iter().any(|p| name.contains(p.as_str()))
+    if let Ok(env_path) = std::env::var(MANIFEST_ENV_VAR)
+        && !env_path.is_empty()
+    {
+        let p = std::path::PathBuf::from(env_path);
+        return Ok(Some(load_manifest(&p)?));
+    }
+    if config.use_embedded_baseline {
+        // Embedded baseline: clone once so callers own a DissectManifest.
+        // The OnceLock inside manifest.rs keeps the parse one-shot.
+        return Ok(Some(embedded_grok1_baseline()?.clone()));
+    }
+    Ok(None)
+}
+
+/// Return `true` if a deprecation warning about `router_patterns`
+/// alongside a manifest should be emitted.
+///
+/// Exposed (crate-private) so tests can assert the condition without
+/// capturing stderr.
+pub(crate) fn should_warn_router_patterns_deprecated(
+    manifest: Option<&DissectManifest>,
+    config: &QuantizationConfig,
+) -> bool {
+    manifest.is_some() && !config.router_patterns.is_empty()
+}
+
+fn maybe_warn_router_patterns_deprecated(
+    manifest: Option<&DissectManifest>,
+    config: &QuantizationConfig,
+) {
+    if should_warn_router_patterns_deprecated(manifest, config) {
+        eprintln!(
+            "grok-ozempic: router_patterns is set alongside an xai-dissect manifest; \
+             the manifest wins and router_patterns is ignored (deprecated)."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +186,22 @@ struct ManifestEntry {
     source_path: PathBuf,
     tensor_name: String,
     shape: Vec<u64>,
-    is_router: bool,
+    precision: TensorPrecision,
+    gif_threshold: f32,
+}
+
+impl ManifestEntry {
+    /// True when this tensor goes through the FP16 passthrough path.
+    ///
+    /// TODO(phase-3): [`TensorPrecision::Preserve`] is currently aliased
+    /// to FP16 passthrough here. This is the single site of the
+    /// transitional alias; removal tracked in issue #6.
+    fn uses_fp16_passthrough(&self) -> bool {
+        matches!(
+            self.precision,
+            TensorPrecision::Fp16 | TensorPrecision::Preserve
+        )
+    }
 }
 
 /// Diagnostic statistics emitted after processing each shard / source file.
@@ -149,6 +216,9 @@ pub struct ShardStats {
 
 /// Run the full out-of-core quantization pipeline described by `config`.
 pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> {
+    let dissect_manifest = resolve_manifest(config)?;
+    maybe_warn_router_patterns_deprecated(dissect_manifest.as_ref(), config);
+
     let manifest = match config.input_format {
         QuantizationInputFormat::Safetensors => {
             let shards = collect_safetensor_shards(&config.input_dir)?;
@@ -158,7 +228,7 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
                     config.input_dir
                 )));
             }
-            build_manifest_safetensors(&shards, &config.router_patterns)?
+            build_manifest_safetensors(&shards, dissect_manifest.as_ref(), config)?
         }
         QuantizationInputFormat::NpyDir => {
             let paths = collect_npy_files(&config.input_dir)?;
@@ -168,7 +238,7 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
                     config.input_dir
                 )));
             }
-            build_manifest_npy(&paths, &config.router_patterns)?
+            build_manifest_npy(&paths, dissect_manifest.as_ref(), config)?
         }
     };
 
@@ -183,7 +253,10 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         .map(|e| PackTensorHeader {
             name: e.tensor_name.clone(),
             shape: e.shape.clone(),
-            tensor_type: if e.is_router {
+            // TODO(phase-3): Preserve currently shares TENSOR_F16 with
+            // Fp16. Once source-dtype passthrough lands, introduce a
+            // dedicated TENSOR_PRESERVE constant. Tracked in issue #6.
+            tensor_type: if e.uses_fp16_passthrough() {
                 TENSOR_F16
             } else {
                 TENSOR_TERNARY
@@ -200,9 +273,19 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         "oz.quantization_version".into(),
         PackMetaValue::U32(1),
     );
+    // Record the effective baseline gif_threshold so the artifact's
+    // provenance metadata reflects what was actually applied. When the
+    // manifest supplies a defaults.gif_threshold that overrides the
+    // config value, that manifest default is recorded here. Per-tensor
+    // overrides from ternary_candidates can differ, but this captures the
+    // pipeline-level default that governs the majority of tensors.
+    let effective_gif_threshold = dissect_manifest
+        .as_ref()
+        .and_then(|m| m.defaults.gif_threshold)
+        .unwrap_or(config.gif_threshold);
     metadata.insert(
         "oz.gif_threshold".into(),
-        PackMetaValue::Str(config.gif_threshold.to_string()),
+        PackMetaValue::Str(effective_gif_threshold.to_string()),
     );
     append_grok1_arch_metadata(&mut metadata);
 
@@ -235,7 +318,7 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         }
 
         let (packed, ternary_sparsity) = quantize_manifest_entry(entry, config)?;
-        if entry.is_router {
+        if entry.uses_fp16_passthrough() {
             shard_stats.tensors_fp16 += 1;
         } else {
             shard_stats.tensors_ternary += 1;
@@ -273,7 +356,7 @@ fn quantize_manifest_entry(
 
 fn quantize_safetensors_entry(
     entry: &ManifestEntry,
-    config: &QuantizationConfig,
+    _config: &QuantizationConfig,
 ) -> Result<(Vec<u8>, Option<f32>)> {
     let file = File::open(&entry.source_path).map_err(GrokOzempicError::Io)?;
     let mmap = unsafe { MmapOptions::new().map(&file).map_err(GrokOzempicError::Io)? };
@@ -288,22 +371,22 @@ fn quantize_safetensors_entry(
         )));
     }
 
-    if entry.is_router {
+    if entry.uses_fp16_passthrough() {
         let fp16_bytes = router_fp16_bytes(dtype, view.data())?;
         Ok((fp16_bytes, None))
     } else {
         let qt = match dtype {
             SourceDtype::F32 => {
                 let f32_slice = bytemuck_cast_f32(view.data());
-                quantize_f32(f32_slice, config.gif_threshold)
+                quantize_f32(f32_slice, entry.gif_threshold)
             }
             SourceDtype::F16 => {
                 let f16_slice: &[f16] = bytemuck_cast_f16(view.data());
-                quantize_f16(f16_slice, config.gif_threshold)
+                quantize_f16(f16_slice, entry.gif_threshold)
             }
             SourceDtype::BF16 => {
                 let f32_vals = bf16_bytes_to_f32(view.data());
-                quantize_f32(&f32_vals, config.gif_threshold)
+                quantize_f32(&f32_vals, entry.gif_threshold)
             }
             SourceDtype::Other => unreachable!(),
         };
@@ -314,7 +397,7 @@ fn quantize_safetensors_entry(
 
 fn quantize_npy_entry(
     entry: &ManifestEntry,
-    config: &QuantizationConfig,
+    _config: &QuantizationConfig,
 ) -> Result<(Vec<u8>, Option<f32>)> {
     let npy = MmapNpy::map_path(&entry.source_path)?;
     let dtype = npy_dtype_to_source(npy.dtype());
@@ -326,22 +409,22 @@ fn quantize_npy_entry(
     }
     let raw = npy.data();
 
-    if entry.is_router {
+    if entry.uses_fp16_passthrough() {
         let fp16_bytes = router_fp16_bytes(dtype, raw)?;
         Ok((fp16_bytes, None))
     } else {
         let qt = match dtype {
             SourceDtype::F32 => {
                 let f32_slice = bytemuck_cast_f32(raw);
-                quantize_f32(f32_slice, config.gif_threshold)
+                quantize_f32(f32_slice, entry.gif_threshold)
             }
             SourceDtype::F16 => {
                 let f16_slice: &[f16] = bytemuck_cast_f16(raw);
-                quantize_f16(f16_slice, config.gif_threshold)
+                quantize_f16(f16_slice, entry.gif_threshold)
             }
             SourceDtype::BF16 => {
                 let f32_vals = bf16_bytes_to_f32(raw);
-                quantize_f32(&f32_vals, config.gif_threshold)
+                quantize_f32(&f32_vals, entry.gif_threshold)
             }
             SourceDtype::Other => unreachable!(),
         };
@@ -369,9 +452,28 @@ fn router_fp16_bytes(dtype: SourceDtype, raw: &[u8]) -> Result<Vec<u8>> {
     Ok(b)
 }
 
+fn classify_and_decide(
+    name: &str,
+    dissect_manifest: Option<&DissectManifest>,
+    config: &QuantizationConfig,
+) -> Result<(TensorClass, TensorPrecision, f32)> {
+    // selection.rs is the single source of truth for classification.
+    // When a manifest is supplied, router_patterns is ignored (the
+    // deprecation warning above already informed the caller).
+    let legacy_patterns: &[String] = if dissect_manifest.is_some() {
+        &[]
+    } else {
+        &config.router_patterns
+    };
+    let class = classify(name, dissect_manifest, legacy_patterns);
+    let (precision, gif_threshold) = precision_decide(&class, dissect_manifest, config)?;
+    Ok((class, precision, gif_threshold))
+}
+
 fn build_manifest_safetensors(
     shards: &[PathBuf],
-    patterns: &[String],
+    dissect_manifest: Option<&DissectManifest>,
+    config: &QuantizationConfig,
 ) -> Result<Vec<ManifestEntry>> {
     let mut v = Vec::new();
     for shard in shards {
@@ -383,20 +485,26 @@ fn build_manifest_safetensors(
             if dtype == SourceDtype::Other {
                 continue;
             }
-            let is_router = is_router_tensor(&name, patterns);
+            let (_class, precision, gif_threshold) =
+                classify_and_decide(&name, dissect_manifest, config)?;
             let shape: Vec<u64> = view.shape().iter().map(|&d| d as u64).collect();
             v.push(ManifestEntry {
                 source_path: shard.clone(),
                 tensor_name: name,
                 shape,
-                is_router,
+                precision,
+                gif_threshold,
             });
         }
     }
     Ok(v)
 }
 
-fn build_manifest_npy(paths: &[PathBuf], patterns: &[String]) -> Result<Vec<ManifestEntry>> {
+fn build_manifest_npy(
+    paths: &[PathBuf],
+    dissect_manifest: Option<&DissectManifest>,
+    config: &QuantizationConfig,
+) -> Result<Vec<ManifestEntry>> {
     let mut v = Vec::new();
     for path in paths {
         let npy = MmapNpy::map_path(path)?;
@@ -411,13 +519,15 @@ fn build_manifest_npy(paths: &[PathBuf], patterns: &[String]) -> Result<Vec<Mani
                 GrokOzempicError::InvalidConfig(format!("bad npy filename: {}", path.display()))
             })?;
         let tensor_name = npy_stem_to_tensor_name(stem);
-        let is_router = is_router_tensor(&tensor_name, patterns);
+        let (_class, precision, gif_threshold) =
+            classify_and_decide(&tensor_name, dissect_manifest, config)?;
         let shape: Vec<u64> = npy.shape().iter().map(|&d| d as u64).collect();
         v.push(ManifestEntry {
             source_path: path.clone(),
             tensor_name,
             shape,
-            is_router,
+            precision,
+            gif_threshold,
         });
     }
     Ok(v)
@@ -459,6 +569,12 @@ fn bytemuck_cast_f16(raw: &[u8]) -> &[f16] {
     }
 }
 
+/// Serialises env-var mutations across tests that touch
+/// `GROK_OZEMPIC_MANIFEST`. Declared at the module level so the
+/// `#[cfg(test)]` test module can refer to it via `super::`.
+#[cfg(test)]
+static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn bf16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
     assert_eq!(raw.len() % 2, 0, "bf16 data length must be a multiple of 2");
     raw.chunks_exact(2)
@@ -474,20 +590,163 @@ fn bf16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn router_classification_defaults() {
-        assert!(is_router_tensor("blk.0.moe_gate.weight", &[]));
-        assert!(is_router_tensor("model.layers.4.expert_router.weight", &[]));
-        assert!(is_router_tensor("transformer.h.1.routing.weight", &[]));
-        assert!(!is_router_tensor("blk.0.ffn_up.weight", &[]));
-        assert!(!is_router_tensor("blk.0.ffn_down.weight", &[]));
+    // Router-classification tests moved to src/core/selection.rs; this
+    // file no longer owns classification logic.
+
+    // ---------- test helpers ----------
+    //
+    // Minimal FP32 `.npy` writer sufficient for round-tripping through
+    // `run_quantization`. Mirrors the header format exercised by
+    // `core::npy::tests::parse_simple_v1_header`.
+    fn write_npy_f32(path: &std::path::Path, shape: &[usize], data: &[f32]) {
+        use std::io::Write as _;
+        let expected: usize = shape.iter().product();
+        assert_eq!(expected, data.len(), "data length must match shape");
+        let shape_str = if shape.is_empty() {
+            "()".to_string()
+        } else if shape.len() == 1 {
+            format!("({},)", shape[0])
+        } else {
+            let inner = shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({inner})")
+        };
+        let dict = format!(
+            "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
+        );
+        let magic = b"\x93NUMPY";
+        let preamble_len = magic.len() + 1 /* major */ + 1 /* minor */ + 2 /* hlen */;
+        // Pad the header string with spaces so (preamble + hlen) is a
+        // multiple of 64, then terminate with `\n` inside the padded
+        // region (NumPy convention). Our parser only requires 64-byte
+        // alignment, so plain space-padding is fine here.
+        let raw_header_len = dict.len();
+        let total_unpadded = preamble_len + raw_header_len;
+        let pad = (64 - (total_unpadded % 64)) % 64;
+        let header_len = raw_header_len + pad;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(magic);
+        bytes.push(1); // major
+        bytes.push(0); // minor
+        bytes.extend_from_slice(&(header_len as u16).to_le_bytes());
+        bytes.extend_from_slice(dict.as_bytes());
+        bytes.extend(std::iter::repeat(b' ').take(pad));
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&bytes).unwrap();
     }
 
+    /// Per-test unique scratch dir.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("grok-ozempic-stream-{tag}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Write the phase-2 parity fixture. Names chosen so the legacy
+    /// heuristic and the in-tree Grok-1 baseline manifest agree on the
+    /// precision of every tensor:
+    ///
+    /// - `blk.0.moe_gate.weight`      legacy: 'gate'/'moe_gate' substring →
+    ///   FP16. Baseline: preserve list → FP16 (transitional alias).
+    /// - `blk.0.expert_router.weight` legacy: 'expert_router' → FP16.
+    ///   Baseline: preserve → FP16.
+    /// - `blk.0.attn_router.weight`   legacy: 'router' → FP16. Baseline:
+    ///   fp16 list → FP16.
+    /// - `blk.0.ffn_up.weight`        legacy: no match → ternary.
+    ///   Baseline: defaults → ternary_snn.
+    fn write_parity_fixture(dir: &std::path::Path) {
+        // 2x2 tensors are enough to exercise ternary pack alignment.
+        let moe_gate = [0.1f32, -0.2, 0.3, -0.4];
+        let expert_router = [1.0f32, -1.0, 0.5, -0.5];
+        let attn_router = [0.05f32, 0.9, -0.05, -0.9];
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__moe_gate__weight.npy"), &[2, 2], &moe_gate);
+        write_npy_f32(
+            &dir.join("blk__0__expert_router__weight.npy"),
+            &[2, 2],
+            &expert_router,
+        );
+        write_npy_f32(
+            &dir.join("blk__0__attn_router__weight.npy"),
+            &[2, 2],
+            &attn_router,
+        );
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+    }
+
+    fn base_config(dir: &std::path::Path, out: &std::path::Path) -> QuantizationConfig {
+        // gif_threshold must match the baseline manifest's
+        // defaults.gif_threshold (0.05) for parity. The embedded
+        // baseline's default overrides the config value per
+        // precision::decide, so matching the two makes the two code
+        // paths produce identical thresholds on ternary tensors.
+        QuantizationConfig {
+            input_dir: dir.to_string_lossy().into_owned(),
+            output_path: out.to_string_lossy().into_owned(),
+            gif_threshold: 0.05,
+            input_format: QuantizationInputFormat::NpyDir,
+            ..Default::default()
+        }
+    }
+
+    fn goz1_bytes(p: &std::path::Path) -> Vec<u8> {
+        std::fs::read(p).expect("failed to read GOZ1 output")
+    }
+
+    // ---------- tests ----------
+
     #[test]
-    fn router_classification_custom_patterns() {
-        let patterns = vec!["special_router".to_string()];
-        assert!(is_router_tensor("blk.0.special_router.weight", &patterns));
-        assert!(!is_router_tensor("blk.0.gate.weight", &patterns));
+    fn deprecation_warning_fires_when_both_present() {
+        use crate::core::manifest::{
+            DissectManifest, ManifestDefaults, ManifestModel, MANIFEST_NAME_CONVENTION_V1,
+            MANIFEST_SCHEMA_VERSION,
+        };
+        let manifest = DissectManifest {
+            schema: "xai-dissect.manifest".into(),
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            model: ManifestModel {
+                family: "grok-1".into(),
+                source: "".into(),
+                tensor_name_convention: MANIFEST_NAME_CONVENTION_V1.into(),
+            },
+            produced_by: None,
+            defaults: ManifestDefaults::default(),
+            preserve: vec![],
+            fp16: vec![],
+            ternary_candidates: vec![],
+            blocks: vec![],
+        };
+
+        let config_with_patterns = QuantizationConfig {
+            router_patterns: vec!["legacy_router".into()],
+            ..Default::default()
+        };
+        assert!(should_warn_router_patterns_deprecated(
+            Some(&manifest),
+            &config_with_patterns,
+        ));
+
+        let config_empty = QuantizationConfig::default();
+        assert!(!should_warn_router_patterns_deprecated(
+            Some(&manifest),
+            &config_empty,
+        ));
+
+        assert!(!should_warn_router_patterns_deprecated(
+            None,
+            &config_with_patterns,
+        ));
     }
 
     #[test]
@@ -517,5 +776,205 @@ mod tests {
     fn collect_shards_nonexistent_dir() {
         let result = collect_safetensor_shards("/tmp/nonexistent_grok_ozempic_dir_xyz");
         assert!(result.is_err());
+    }
+
+    // ---------- parity / divergence / precedence / env-var ----------
+
+    /// Parity test: on the carefully chosen fixture, the legacy heuristic
+    /// (no manifest) and the embedded Grok-1 baseline (opt-in) produce
+    /// byte-identical GOZ1 output.
+    #[test]
+    fn parity_legacy_vs_baseline_is_byte_identical() {
+        // Hold ENV_TEST_MUTEX so a parallel env-var test cannot leak
+        // GROK_OZEMPIC_MANIFEST into the legacy run below.
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        let dir = scratch_dir("parity-input");
+        write_parity_fixture(&dir);
+
+        let out_legacy = scratch_dir("parity-legacy-out").join("a.goz1");
+        let out_baseline = scratch_dir("parity-baseline-out").join("b.goz1");
+
+        let mut config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy path");
+
+        config.output_path = out_baseline.to_string_lossy().into_owned();
+        config.use_embedded_baseline = true;
+        run_quantization(&config).expect("baseline path");
+
+        let a = goz1_bytes(&out_legacy);
+        let b = goz1_bytes(&out_baseline);
+        if a != b {
+            let first_diff = a
+                .iter()
+                .zip(b.iter())
+                .position(|(x, y)| x != y)
+                .unwrap_or(a.len().min(b.len()));
+            panic!(
+                "parity failed: a.len={} b.len={} first_diff_at={} a_byte={:?} b_byte={:?}",
+                a.len(),
+                b.len(),
+                first_diff,
+                a.get(first_diff),
+                b.get(first_diff),
+            );
+        }
+    }
+
+    /// Divergence test: adding `blk.0.ffn_gate.weight` to the fixture
+    /// forces the two paths apart. The legacy heuristic false-matches
+    /// the `gate` substring and routes it to FP16; the baseline manifest
+    /// does not match it at all so it goes ternary. This documents the
+    /// value of the manifest wiring.
+    #[test]
+    fn divergence_on_ffn_gate_false_positive() {
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        let dir = scratch_dir("diverge-input");
+        write_parity_fixture(&dir);
+        let ffn_gate = [0.7f32, -0.7, 0.4, -0.4];
+        write_npy_f32(
+            &dir.join("blk__0__ffn_gate__weight.npy"),
+            &[2, 2],
+            &ffn_gate,
+        );
+
+        let out_legacy = scratch_dir("diverge-legacy-out").join("a.goz1");
+        let out_baseline = scratch_dir("diverge-baseline-out").join("b.goz1");
+
+        let mut config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy path");
+
+        config.output_path = out_baseline.to_string_lossy().into_owned();
+        config.use_embedded_baseline = true;
+        run_quantization(&config).expect("baseline path");
+
+        let a = goz1_bytes(&out_legacy);
+        let b = goz1_bytes(&out_baseline);
+        assert_ne!(
+            a, b,
+            "`ffn_gate` false-positive should make the two paths diverge"
+        );
+    }
+
+    /// End-to-end: an explicit `manifest_path` winning over the embedded
+    /// baseline and producing the same bytes as a config that points at
+    /// the in-tree baseline file directly.
+    #[test]
+    fn explicit_manifest_path_wins_over_env_var() {
+        // Build a tiny manifest-from-disk and a DIFFERENT env-var manifest.
+        // Classify a single tensor that each classifies differently; the
+        // explicit path must win.
+        let dir = scratch_dir("prec-input");
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+
+        // Explicit manifest forces ffn_up to FP16.
+        let explicit_path = scratch_dir("prec-explicit").join("m.json");
+        std::fs::write(
+            &explicit_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "fp16": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        // Env manifest forces ffn_up into preserve.
+        let env_path = scratch_dir("prec-env").join("m.json");
+        std::fs::write(
+            &env_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "preserve": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let out_a = scratch_dir("prec-out-a").join("a.goz1");
+        let out_b = scratch_dir("prec-out-b").join("b.goz1");
+
+        // Serialize env-var mutations for test-safety.
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        // SAFETY: mutation guarded by the single-threaded test mutex.
+        unsafe { std::env::set_var(MANIFEST_ENV_VAR, &env_path) };
+
+        // A: explicit + env — explicit must win.
+        let mut config = base_config(&dir, &out_a);
+        config.manifest_path = Some(explicit_path.clone());
+        run_quantization(&config).expect("explicit+env run");
+
+        // B: explicit only — same explicit manifest, no env. Should
+        // produce identical bytes to A if explicit truly won.
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+        let mut config = base_config(&dir, &out_b);
+        config.manifest_path = Some(explicit_path.clone());
+        run_quantization(&config).expect("explicit only run");
+
+        let a = goz1_bytes(&out_a);
+        let b = goz1_bytes(&out_b);
+        assert_eq!(
+            a, b,
+            "explicit manifest_path must win over GROK_OZEMPIC_MANIFEST"
+        );
+    }
+
+    /// `GROK_OZEMPIC_MANIFEST` is honored when no explicit path is set
+    /// (and changes classification versus the no-manifest legacy path).
+    #[test]
+    fn env_var_manifest_is_resolved_when_no_explicit_path() {
+        let dir = scratch_dir("env-input");
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+
+        // Env manifest forces ffn_up to FP16 (legacy heuristic would
+        // leave it ternary, so the bytes must differ).
+        let env_path = scratch_dir("env-manifest").join("m.json");
+        std::fs::write(
+            &env_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "fp16": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let out_legacy = scratch_dir("env-out-legacy").join("a.goz1");
+        let out_env = scratch_dir("env-out-env").join("b.goz1");
+
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        // Legacy run (env var unset).
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+        let config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy run");
+
+        // Env-var run.
+        unsafe { std::env::set_var(MANIFEST_ENV_VAR, &env_path) };
+        let config = base_config(&dir, &out_env);
+        run_quantization(&config).expect("env var run");
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        assert_ne!(
+            goz1_bytes(&out_legacy),
+            goz1_bytes(&out_env),
+            "env-var-supplied manifest must change classification vs legacy"
+        );
     }
 }
