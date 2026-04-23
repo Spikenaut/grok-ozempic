@@ -65,9 +65,10 @@ pub struct DissectManifest {
     #[serde(default)]
     pub defaults: ManifestDefaults,
 
-    /// Tensors that must keep their source precision (routing-critical
-    /// layers, etc.). Reserved in phase 1; not yet consumed by the
-    /// pipeline.
+    /// Routing-critical / no-touch tensors. Consumed by the
+    /// selection seam (`crate::core::selection::classify`) and mapped
+    /// to [`crate::types::TensorPrecision::Preserve`], which in GOZ1
+    /// v1 is FP16-at-rest (see that variant's docs).
     #[serde(default)]
     pub preserve: Vec<PreserveEntry>,
 

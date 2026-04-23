@@ -95,7 +95,7 @@ legacy field remains supported only for the manifest-less fallback path.
 
 | Tier           | Meaning                                                 |
 | -------------- | ------------------------------------------------------- |
-| `preserve`     | Keep source dtype. **Reserved in phase 1** — consumed by the pipeline in a later phase. During the transitional window this may be aliased to FP16 passthrough; the alias is temporary and tracked via a follow-up issue. |
+| `preserve`     | Routing-critical / no-touch tier. **GOZ1 v1: FP16-at-rest** — emits the same on-disk bytes as `fp16` (both use `TENSOR_F16`). Kept as a distinct tier to carry manifest intent (which list claimed the tensor) and to leave room for a future GOZ1 format version that may introduce true source-dtype passthrough. This is the **final, documented behavior** for GOZ1 v1, not a transitional shortcut. |
 | `fp16`         | Force FP16 passthrough (current router behavior).       |
 | `ternary_snn` | Ternary {-1, 0, +1} with GIF saliency threshold.         |
 
