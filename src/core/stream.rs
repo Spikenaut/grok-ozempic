@@ -273,9 +273,19 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         "oz.quantization_version".into(),
         PackMetaValue::U32(1),
     );
+    // Record the effective baseline gif_threshold so the artifact's
+    // provenance metadata reflects what was actually applied. When the
+    // manifest supplies a defaults.gif_threshold that overrides the
+    // config value, that manifest default is recorded here. Per-tensor
+    // overrides from ternary_candidates can differ, but this captures the
+    // pipeline-level default that governs the majority of tensors.
+    let effective_gif_threshold = dissect_manifest
+        .as_ref()
+        .and_then(|m| m.defaults.gif_threshold)
+        .unwrap_or(config.gif_threshold);
     metadata.insert(
         "oz.gif_threshold".into(),
-        PackMetaValue::Str(config.gif_threshold.to_string()),
+        PackMetaValue::Str(effective_gif_threshold.to_string()),
     );
     append_grok1_arch_metadata(&mut metadata);
 

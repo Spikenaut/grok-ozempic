@@ -211,6 +211,22 @@ pub fn parse_manifest_bytes(bytes: &[u8], label: &str) -> Result<DissectManifest
         });
     }
 
+    // Validate defaults.precision eagerly so a malformed manifest always
+    // hard-fails regardless of which tensors are actually processed. Without
+    // this check an invalid string would only surface when a tensor falls
+    // through to the Default class — a coverage-dependent, non-deterministic
+    // failure mode.
+    if let Some(ref p) = manifest.defaults.precision {
+        match p.as_str() {
+            "ternary_snn" | "fp16" | "preserve" => {}
+            other => {
+                return Err(GrokOzempicError::ManifestInvalidPrecision {
+                    got: other.to_string(),
+                });
+            }
+        }
+    }
+
     Ok(manifest)
 }
 
@@ -450,5 +466,32 @@ mod tests {
             "expected ManifestParse, got {err:?}"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// Regression guard for the eager defaults.precision validation:
+    /// a manifest with an invalid precision string must always hard-fail
+    /// at parse time regardless of which tensors are present.
+    #[test]
+    fn invalid_defaults_precision_is_rejected_at_parse_time() {
+        let json = br#"{
+            "schema": "xai-dissect.manifest",
+            "schema_version": 1,
+            "model": {
+                "family": "grok-1",
+                "tensor_name_convention": "blk.{L}.{role}.weight"
+            },
+            "defaults": { "precision": "bogus_tier" },
+            "preserve": [ { "name": "blk.*.*.weight" } ]
+        }"#;
+        // All tensors would be covered by the preserve glob, but the
+        // invalid precision string must still fail at parse time.
+        let err = parse_manifest_bytes(json, "<test>").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GrokOzempicError::ManifestInvalidPrecision { ref got } if got == "bogus_tier"
+            ),
+            "expected ManifestInvalidPrecision(bogus_tier), got {err:?}"
+        );
     }
 }
