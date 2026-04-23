@@ -13,20 +13,26 @@ pub enum TensorPrecision {
     TernarySnN,
     /// Keep original FP16 — used for MoE routing gates.
     Fp16,
-    /// Keep the tensor in its source dtype (routing-critical layers etc.).
+    /// Routing-critical / no-touch tier. Populated when the
+    /// `xai-dissect` manifest's `preserve` list matches a tensor
+    /// (typically MoE routers, expert gates, attention readouts).
     ///
-    /// **Reserved in phase 1.** This variant is declared so the
-    /// `xai-dissect` manifest contract can reference it, but it is **not
-    /// yet consumed** by [`crate::core::stream::run_quantization`]. A
-    /// follow-up PR will wire it through the selection / precision seams.
+    /// **GOZ1 v1 on-disk encoding:** identical FP16 bytes to
+    /// [`TensorPrecision::Fp16`] — both tiers serialize through the
+    /// same FP16 writer path and use `TENSOR_F16` in the GOZ1 tensor
+    /// table. This is the **final, documented behavior** for GOZ1 v1,
+    /// not a transitional shortcut.
     ///
-    /// **Temporary semantic shortcut:** during the transitional window
-    /// the wiring code may alias `Preserve` to FP16 passthrough. That
-    /// alias is explicitly temporary and must be removed once
-    /// source-dtype passthrough lands. See the phase 2/3 tracking issue.
-    //
-    // TODO(phase-3): remove any Preserve→FP16 alias once source-dtype
-    // passthrough is implemented in stream.rs + weight_pack.rs.
+    /// The variant is kept distinct from [`TensorPrecision::Fp16`] for
+    /// three reasons:
+    /// 1. **Manifest-intent traceability** — pipeline diagnostics can
+    ///    tell which manifest list claimed a tensor.
+    /// 2. **Policy guarantee** — `Preserve` signals "must never be
+    ///    ternary-quantized" even if a future policy change shifts the
+    ///    default for `Fp16`.
+    /// 3. **Forward compatibility** — a future GOZ1 format version may
+    ///    promote `Preserve` to true source-dtype passthrough
+    ///    (F32/BF16 kept as-is) without an API rename or migration.
     Preserve,
 }
 

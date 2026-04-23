@@ -9,6 +9,8 @@
 //!
 //! Precision tier resolution:
 //! - `TensorClass::Preserve`          → [`TensorPrecision::Preserve`]
+//!   (FP16-at-rest in GOZ1 v1; semantically distinct from `Fp16`,
+//!   identical on disk — see the `TensorPrecision::Preserve` docs).
 //! - `TensorClass::Fp16`              → [`TensorPrecision::Fp16`]
 //! - `TensorClass::TernaryCandidate`  → [`TensorPrecision::TernarySnN`]
 //! - `TensorClass::Default`           → parsed from

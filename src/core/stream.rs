@@ -191,12 +191,14 @@ struct ManifestEntry {
 }
 
 impl ManifestEntry {
-    /// True when this tensor goes through the FP16 passthrough path.
+    /// True when this tensor is emitted as FP16 bytes in the GOZ1
+    /// tensor table (i.e. tagged `TENSOR_F16`).
     ///
-    /// TODO(phase-3): [`TensorPrecision::Preserve`] is currently aliased
-    /// to FP16 passthrough here. This is the single site of the
-    /// transitional alias; removal tracked in issue #6.
-    fn uses_fp16_passthrough(&self) -> bool {
+    /// In GOZ1 v1 both [`TensorPrecision::Fp16`] and
+    /// [`TensorPrecision::Preserve`] share the FP16-at-rest encoding
+    /// (see the `TensorPrecision::Preserve` doc for rationale). The
+    /// two tiers remain semantically distinct upstream of this point.
+    fn emits_fp16_bytes(&self) -> bool {
         matches!(
             self.precision,
             TensorPrecision::Fp16 | TensorPrecision::Preserve
@@ -253,10 +255,11 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         .map(|e| PackTensorHeader {
             name: e.tensor_name.clone(),
             shape: e.shape.clone(),
-            // TODO(phase-3): Preserve currently shares TENSOR_F16 with
-            // Fp16. Once source-dtype passthrough lands, introduce a
-            // dedicated TENSOR_PRESERVE constant. Tracked in issue #6.
-            tensor_type: if e.uses_fp16_passthrough() {
+            // GOZ1 v1: Fp16 and Preserve share the TENSOR_F16 encoding
+            // by design (see TensorPrecision::Preserve). The semantic
+            // distinction lives in the manifest / classifier, not in
+            // the tensor table.
+            tensor_type: if e.emits_fp16_bytes() {
                 TENSOR_F16
             } else {
                 TENSOR_TERNARY
@@ -318,7 +321,7 @@ pub fn run_quantization(config: &QuantizationConfig) -> Result<Vec<ShardStats>> 
         }
 
         let (packed, ternary_sparsity) = quantize_manifest_entry(entry, config)?;
-        if entry.uses_fp16_passthrough() {
+        if entry.emits_fp16_bytes() {
             shard_stats.tensors_fp16 += 1;
         } else {
             shard_stats.tensors_ternary += 1;
@@ -371,8 +374,8 @@ fn quantize_safetensors_entry(
         )));
     }
 
-    if entry.uses_fp16_passthrough() {
-        let fp16_bytes = router_fp16_bytes(dtype, view.data())?;
+    if entry.emits_fp16_bytes() {
+        let fp16_bytes = encode_fp16_bytes(dtype, view.data())?;
         Ok((fp16_bytes, None))
     } else {
         let qt = match dtype {
@@ -409,8 +412,8 @@ fn quantize_npy_entry(
     }
     let raw = npy.data();
 
-    if entry.uses_fp16_passthrough() {
-        let fp16_bytes = router_fp16_bytes(dtype, raw)?;
+    if entry.emits_fp16_bytes() {
+        let fp16_bytes = encode_fp16_bytes(dtype, raw)?;
         Ok((fp16_bytes, None))
     } else {
         let qt = match dtype {
@@ -433,7 +436,10 @@ fn quantize_npy_entry(
     }
 }
 
-fn router_fp16_bytes(dtype: SourceDtype, raw: &[u8]) -> Result<Vec<u8>> {
+/// Encode raw source bytes as FP16 for tensors that emit through the
+/// GOZ1 `TENSOR_F16` slot (both `TensorPrecision::Fp16` and
+/// `TensorPrecision::Preserve` route here in GOZ1 v1).
+fn encode_fp16_bytes(dtype: SourceDtype, raw: &[u8]) -> Result<Vec<u8>> {
     let b = match dtype {
         SourceDtype::F16 => {
             let f16_slice: &[f16] = bytemuck_cast_f16(raw);
@@ -658,9 +664,9 @@ mod tests {
     /// precision of every tensor:
     ///
     /// - `blk.0.moe_gate.weight`      legacy: 'gate'/'moe_gate' substring →
-    ///   FP16. Baseline: preserve list → FP16 (transitional alias).
+    ///   FP16. Baseline: preserve list → FP16-at-rest (GOZ1 v1).
     /// - `blk.0.expert_router.weight` legacy: 'expert_router' → FP16.
-    ///   Baseline: preserve → FP16.
+    ///   Baseline: preserve → FP16-at-rest (GOZ1 v1).
     /// - `blk.0.attn_router.weight`   legacy: 'router' → FP16. Baseline:
     ///   fp16 list → FP16.
     /// - `blk.0.ffn_up.weight`        legacy: no match → ternary.
@@ -976,5 +982,89 @@ mod tests {
             goz1_bytes(&out_env),
             "env-var-supplied manifest must change classification vs legacy"
         );
+    }
+
+    /// Regression guard for the **final GOZ1-v1 semantic** of
+    /// `TensorPrecision::Preserve`: a tensor classified `Preserve`
+    /// (manifest `preserve` list) and the same tensor classified
+    /// `Fp16` (manifest `fp16` list) must produce **byte-identical**
+    /// GOZ1 output. The two tiers are semantically distinct upstream
+    /// but share the FP16-at-rest encoding on disk.
+    ///
+    /// If a future change introduces a separate `TENSOR_PRESERVE`
+    /// constant or a different on-disk encoding for `Preserve`, this
+    /// test will fail and force an explicit decision rather than
+    /// silent drift.
+    #[test]
+    fn preserve_and_fp16_tiers_emit_identical_goz1_bytes() {
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        let dir = scratch_dir("preserve-fp16-input");
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+
+        // Manifest A: tensor lives in `preserve`.
+        let preserve_path = scratch_dir("preserve-manifest").join("m.json");
+        std::fs::write(
+            &preserve_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "preserve": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        // Manifest B: same tensor, but listed under `fp16`.
+        let fp16_path = scratch_dir("fp16-manifest").join("m.json");
+        std::fs::write(
+            &fp16_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "fp16": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let out_preserve = scratch_dir("preserve-out").join("a.goz1");
+        let out_fp16 = scratch_dir("fp16-out").join("b.goz1");
+
+        let mut config = base_config(&dir, &out_preserve);
+        config.manifest_path = Some(preserve_path);
+        run_quantization(&config).expect("preserve-tier run");
+
+        let mut config = base_config(&dir, &out_fp16);
+        config.manifest_path = Some(fp16_path);
+        run_quantization(&config).expect("fp16-tier run");
+
+        let a = goz1_bytes(&out_preserve);
+        let b = goz1_bytes(&out_fp16);
+        if a != b {
+            let first_diff = a
+                .iter()
+                .zip(b.iter())
+                .position(|(x, y)| x != y)
+                .unwrap_or(a.len().min(b.len()));
+            panic!(
+                "Preserve and Fp16 tiers diverged: a.len={} b.len={} \
+                 first_diff_at={} a_byte={:?} b_byte={:?}. \
+                 In GOZ1 v1 they must emit identical FP16 bytes.",
+                a.len(),
+                b.len(),
+                first_diff,
+                a.get(first_diff),
+                b.get(first_diff),
+            );
+        }
     }
 }
