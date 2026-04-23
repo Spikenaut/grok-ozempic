@@ -99,22 +99,28 @@ pub const MANIFEST_ENV_VAR: &str = "GROK_OZEMPIC_MANIFEST";
 ///
 /// 1. [`QuantizationConfig::manifest_path`] (explicit caller override).
 /// 2. `GROK_OZEMPIC_MANIFEST` environment variable.
-/// 3. Embedded Grok-1 baseline via [`embedded_grok1_baseline`].
+/// 3. Embedded Grok-1 baseline via [`embedded_grok1_baseline`], but
+///    **only** when [`QuantizationConfig::use_embedded_baseline`] is
+///    `true`. This is opt-in so upgrading from phase 1 does not
+///    silently apply a Grok-1 manifest to non-Grok-1 exports.
 /// 4. `None` — selection falls back to the legacy heuristic in
 ///    [`crate::core::selection::classify`].
 fn resolve_manifest(config: &QuantizationConfig) -> Result<Option<DissectManifest>> {
     if let Some(path) = &config.manifest_path {
         return Ok(Some(load_manifest(path)?));
     }
-    if let Ok(env_path) = std::env::var(MANIFEST_ENV_VAR) {
-        if !env_path.is_empty() {
-            let p = std::path::PathBuf::from(env_path);
-            return Ok(Some(load_manifest(&p)?));
-        }
+    if let Ok(env_path) = std::env::var(MANIFEST_ENV_VAR)
+        && !env_path.is_empty()
+    {
+        let p = std::path::PathBuf::from(env_path);
+        return Ok(Some(load_manifest(&p)?));
     }
-    // Embedded baseline: clone once so callers own a DissectManifest.
-    // The OnceLock inside manifest.rs keeps the parse one-shot.
-    Ok(Some(embedded_grok1_baseline()?.clone()))
+    if config.use_embedded_baseline {
+        // Embedded baseline: clone once so callers own a DissectManifest.
+        // The OnceLock inside manifest.rs keeps the parse one-shot.
+        return Ok(Some(embedded_grok1_baseline()?.clone()));
+    }
+    Ok(None)
 }
 
 /// Return `true` if a deprecation warning about `router_patterns`
@@ -553,6 +559,12 @@ fn bytemuck_cast_f16(raw: &[u8]) -> &[f16] {
     }
 }
 
+/// Serialises env-var mutations across tests that touch
+/// `GROK_OZEMPIC_MANIFEST`. Declared at the module level so the
+/// `#[cfg(test)]` test module can refer to it via `super::`.
+#[cfg(test)]
+static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn bf16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
     assert_eq!(raw.len() % 2, 0, "bf16 data length must be a multiple of 2");
     raw.chunks_exact(2)
@@ -570,6 +582,119 @@ mod tests {
 
     // Router-classification tests moved to src/core/selection.rs; this
     // file no longer owns classification logic.
+
+    // ---------- test helpers ----------
+    //
+    // Minimal FP32 `.npy` writer sufficient for round-tripping through
+    // `run_quantization`. Mirrors the header format exercised by
+    // `core::npy::tests::parse_simple_v1_header`.
+    fn write_npy_f32(path: &std::path::Path, shape: &[usize], data: &[f32]) {
+        use std::io::Write as _;
+        let expected: usize = shape.iter().product();
+        assert_eq!(expected, data.len(), "data length must match shape");
+        let shape_str = if shape.is_empty() {
+            "()".to_string()
+        } else if shape.len() == 1 {
+            format!("({},)", shape[0])
+        } else {
+            let inner = shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({inner})")
+        };
+        let dict = format!(
+            "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
+        );
+        let magic = b"\x93NUMPY";
+        let preamble_len = magic.len() + 1 /* major */ + 1 /* minor */ + 2 /* hlen */;
+        // Pad the header string with spaces so (preamble + hlen) is a
+        // multiple of 64, then terminate with `\n` inside the padded
+        // region (NumPy convention). Our parser only requires 64-byte
+        // alignment, so plain space-padding is fine here.
+        let raw_header_len = dict.len();
+        let total_unpadded = preamble_len + raw_header_len;
+        let pad = (64 - (total_unpadded % 64)) % 64;
+        let header_len = raw_header_len + pad;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(magic);
+        bytes.push(1); // major
+        bytes.push(0); // minor
+        bytes.extend_from_slice(&(header_len as u16).to_le_bytes());
+        bytes.extend_from_slice(dict.as_bytes());
+        bytes.extend(std::iter::repeat(b' ').take(pad));
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&bytes).unwrap();
+    }
+
+    /// Per-test unique scratch dir.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("grok-ozempic-stream-{tag}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Write the phase-2 parity fixture. Names chosen so the legacy
+    /// heuristic and the in-tree Grok-1 baseline manifest agree on the
+    /// precision of every tensor:
+    ///
+    /// - `blk.0.moe_gate.weight`      legacy: 'gate'/'moe_gate' substring →
+    ///   FP16. Baseline: preserve list → FP16 (transitional alias).
+    /// - `blk.0.expert_router.weight` legacy: 'expert_router' → FP16.
+    ///   Baseline: preserve → FP16.
+    /// - `blk.0.attn_router.weight`   legacy: 'router' → FP16. Baseline:
+    ///   fp16 list → FP16.
+    /// - `blk.0.ffn_up.weight`        legacy: no match → ternary.
+    ///   Baseline: defaults → ternary_snn.
+    fn write_parity_fixture(dir: &std::path::Path) {
+        // 2x2 tensors are enough to exercise ternary pack alignment.
+        let moe_gate = [0.1f32, -0.2, 0.3, -0.4];
+        let expert_router = [1.0f32, -1.0, 0.5, -0.5];
+        let attn_router = [0.05f32, 0.9, -0.05, -0.9];
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__moe_gate__weight.npy"), &[2, 2], &moe_gate);
+        write_npy_f32(
+            &dir.join("blk__0__expert_router__weight.npy"),
+            &[2, 2],
+            &expert_router,
+        );
+        write_npy_f32(
+            &dir.join("blk__0__attn_router__weight.npy"),
+            &[2, 2],
+            &attn_router,
+        );
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+    }
+
+    fn base_config(dir: &std::path::Path, out: &std::path::Path) -> QuantizationConfig {
+        // gif_threshold must match the baseline manifest's
+        // defaults.gif_threshold (0.05) for parity. The embedded
+        // baseline's default overrides the config value per
+        // precision::decide, so matching the two makes the two code
+        // paths produce identical thresholds on ternary tensors.
+        QuantizationConfig {
+            input_dir: dir.to_string_lossy().into_owned(),
+            output_path: out.to_string_lossy().into_owned(),
+            gif_threshold: 0.05,
+            input_format: QuantizationInputFormat::NpyDir,
+            ..Default::default()
+        }
+    }
+
+    fn goz1_bytes(p: &std::path::Path) -> Vec<u8> {
+        std::fs::read(p).expect("failed to read GOZ1 output")
+    }
+
+    // ---------- tests ----------
 
     #[test]
     fn deprecation_warning_fires_when_both_present() {
@@ -641,5 +766,205 @@ mod tests {
     fn collect_shards_nonexistent_dir() {
         let result = collect_safetensor_shards("/tmp/nonexistent_grok_ozempic_dir_xyz");
         assert!(result.is_err());
+    }
+
+    // ---------- parity / divergence / precedence / env-var ----------
+
+    /// Parity test: on the carefully chosen fixture, the legacy heuristic
+    /// (no manifest) and the embedded Grok-1 baseline (opt-in) produce
+    /// byte-identical GOZ1 output.
+    #[test]
+    fn parity_legacy_vs_baseline_is_byte_identical() {
+        // Hold ENV_TEST_MUTEX so a parallel env-var test cannot leak
+        // GROK_OZEMPIC_MANIFEST into the legacy run below.
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        let dir = scratch_dir("parity-input");
+        write_parity_fixture(&dir);
+
+        let out_legacy = scratch_dir("parity-legacy-out").join("a.goz1");
+        let out_baseline = scratch_dir("parity-baseline-out").join("b.goz1");
+
+        let mut config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy path");
+
+        config.output_path = out_baseline.to_string_lossy().into_owned();
+        config.use_embedded_baseline = true;
+        run_quantization(&config).expect("baseline path");
+
+        let a = goz1_bytes(&out_legacy);
+        let b = goz1_bytes(&out_baseline);
+        if a != b {
+            let first_diff = a
+                .iter()
+                .zip(b.iter())
+                .position(|(x, y)| x != y)
+                .unwrap_or(a.len().min(b.len()));
+            panic!(
+                "parity failed: a.len={} b.len={} first_diff_at={} a_byte={:?} b_byte={:?}",
+                a.len(),
+                b.len(),
+                first_diff,
+                a.get(first_diff),
+                b.get(first_diff),
+            );
+        }
+    }
+
+    /// Divergence test: adding `blk.0.ffn_gate.weight` to the fixture
+    /// forces the two paths apart. The legacy heuristic false-matches
+    /// the `gate` substring and routes it to FP16; the baseline manifest
+    /// does not match it at all so it goes ternary. This documents the
+    /// value of the manifest wiring.
+    #[test]
+    fn divergence_on_ffn_gate_false_positive() {
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        let dir = scratch_dir("diverge-input");
+        write_parity_fixture(&dir);
+        let ffn_gate = [0.7f32, -0.7, 0.4, -0.4];
+        write_npy_f32(
+            &dir.join("blk__0__ffn_gate__weight.npy"),
+            &[2, 2],
+            &ffn_gate,
+        );
+
+        let out_legacy = scratch_dir("diverge-legacy-out").join("a.goz1");
+        let out_baseline = scratch_dir("diverge-baseline-out").join("b.goz1");
+
+        let mut config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy path");
+
+        config.output_path = out_baseline.to_string_lossy().into_owned();
+        config.use_embedded_baseline = true;
+        run_quantization(&config).expect("baseline path");
+
+        let a = goz1_bytes(&out_legacy);
+        let b = goz1_bytes(&out_baseline);
+        assert_ne!(
+            a, b,
+            "`ffn_gate` false-positive should make the two paths diverge"
+        );
+    }
+
+    /// End-to-end: an explicit `manifest_path` winning over the embedded
+    /// baseline and producing the same bytes as a config that points at
+    /// the in-tree baseline file directly.
+    #[test]
+    fn explicit_manifest_path_wins_over_env_var() {
+        // Build a tiny manifest-from-disk and a DIFFERENT env-var manifest.
+        // Classify a single tensor that each classifies differently; the
+        // explicit path must win.
+        let dir = scratch_dir("prec-input");
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+
+        // Explicit manifest forces ffn_up to FP16.
+        let explicit_path = scratch_dir("prec-explicit").join("m.json");
+        std::fs::write(
+            &explicit_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "fp16": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        // Env manifest forces ffn_up into preserve.
+        let env_path = scratch_dir("prec-env").join("m.json");
+        std::fs::write(
+            &env_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "preserve": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let out_a = scratch_dir("prec-out-a").join("a.goz1");
+        let out_b = scratch_dir("prec-out-b").join("b.goz1");
+
+        // Serialize env-var mutations for test-safety.
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        // SAFETY: mutation guarded by the single-threaded test mutex.
+        unsafe { std::env::set_var(MANIFEST_ENV_VAR, &env_path) };
+
+        // A: explicit + env — explicit must win.
+        let mut config = base_config(&dir, &out_a);
+        config.manifest_path = Some(explicit_path.clone());
+        run_quantization(&config).expect("explicit+env run");
+
+        // B: explicit only — same explicit manifest, no env. Should
+        // produce identical bytes to A if explicit truly won.
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+        let mut config = base_config(&dir, &out_b);
+        config.manifest_path = Some(explicit_path.clone());
+        run_quantization(&config).expect("explicit only run");
+
+        let a = goz1_bytes(&out_a);
+        let b = goz1_bytes(&out_b);
+        assert_eq!(
+            a, b,
+            "explicit manifest_path must win over GROK_OZEMPIC_MANIFEST"
+        );
+    }
+
+    /// `GROK_OZEMPIC_MANIFEST` is honored when no explicit path is set
+    /// (and changes classification versus the no-manifest legacy path).
+    #[test]
+    fn env_var_manifest_is_resolved_when_no_explicit_path() {
+        let dir = scratch_dir("env-input");
+        let ffn_up = [0.3f32, -0.3, 0.01, -0.01];
+        write_npy_f32(&dir.join("blk__0__ffn_up__weight.npy"), &[2, 2], &ffn_up);
+
+        // Env manifest forces ffn_up to FP16 (legacy heuristic would
+        // leave it ternary, so the bytes must differ).
+        let env_path = scratch_dir("env-manifest").join("m.json");
+        std::fs::write(
+            &env_path,
+            r#"{
+                "schema": "xai-dissect.manifest",
+                "schema_version": 1,
+                "model": {
+                    "family": "grok-1",
+                    "tensor_name_convention": "blk.{L}.{role}.weight"
+                },
+                "fp16": [ { "name": "blk.0.ffn_up.weight" } ]
+            }"#,
+        )
+        .unwrap();
+
+        let out_legacy = scratch_dir("env-out-legacy").join("a.goz1");
+        let out_env = scratch_dir("env-out-env").join("b.goz1");
+
+        let _lock = super::ENV_TEST_MUTEX.lock().unwrap();
+        // Legacy run (env var unset).
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+        let config = base_config(&dir, &out_legacy);
+        run_quantization(&config).expect("legacy run");
+
+        // Env-var run.
+        unsafe { std::env::set_var(MANIFEST_ENV_VAR, &env_path) };
+        let config = base_config(&dir, &out_env);
+        run_quantization(&config).expect("env var run");
+        unsafe { std::env::remove_var(MANIFEST_ENV_VAR) };
+
+        assert_ne!(
+            goz1_bytes(&out_legacy),
+            goz1_bytes(&out_env),
+            "env-var-supplied manifest must change classification vs legacy"
+        );
     }
 }
